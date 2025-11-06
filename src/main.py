@@ -356,12 +356,23 @@ class DriveController():
         if js.y <0:
             forward = 0-forward
         turn = js.x*-2
+        
 
         left = forward + turn
         right = forward - turn
         right = 0-right
 
         # clamp to [-100, 100]
+        self.left_speed = max(-100, min(100, left))
+        self.right_speed = max(-100, min(100, right))
+        if self.controller.buttonL1.pressing():
+            self.left_speed *= 0.5
+            self.right_speed *= 0.5
+        if self.controller.buttonY.pressing():
+            self.left_speed *= 0.25
+            self.right_speed *= 0.25
+    
+    def update_manually(self, left, right):
         self.left_speed = max(-100, min(100, left))
         self.right_speed = max(-100, min(100, right))
 
@@ -372,6 +383,23 @@ class DriveController():
         for right_motor in self.right_motors:
             right_motor.set_velocity(self.right_speed, VelocityUnits.PERCENT)
             right_motor.spin(FORWARD)
+
+class Intake:
+    def __init__(self, controller, motor):
+        self.controller=controller
+        self.motor = motor
+        self.speed = 100
+    def update_from_controller(self):
+        if self.controller.buttonR1.pressing():
+            self.motor.spin(FORWARD)
+            self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+        else:
+            if self.controller.buttonR2.pressing():
+                self.motor.spin(FORWARD)
+                self.motor.set_velocity(0-self.speed, VelocityUnits.PERCENT)
+            else:
+                self.motor.spin(FORWARD)
+                self.motor.set_velocity(0, VelocityUnits.PERCENT)
 
         
         
@@ -384,6 +412,7 @@ brain.screen.render()
 logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
 motor1 = Motor(Ports.PORT1)
+intake = Intake(controller,Motor(Ports.PORT5))
 drivetrain = DriveController([Motor(Ports.PORT1),Motor(Ports.PORT2)],[Motor(Ports.PORT3),Motor(Ports.PORT4)],controller)
 
 # setup UI
@@ -403,6 +432,7 @@ while True:
     ui.draw()
     drivetrain.update_from_controller()
     drivetrain.update_motor_speeds()
+    intake.update_from_controller()
 
     
 
