@@ -54,12 +54,12 @@ class Vector2D:
     def __add__(self, other):
         if isinstance(other, Vector2D):
             return Vector2D(self.x + other.x, self.y + other.y)
-        return NotImplemented
+        return Vector2D(self.x + other, self.y + other)
 
     def __sub__(self, other):
         if isinstance(other, Vector2D):
             return Vector2D(self.x - other.x, self.y - other.y)
-        return NotImplemented
+        return self.__add__(-other)
 
     def __mul__(self, other):
         # scalar multiplication or element-wise with another vector
@@ -129,7 +129,7 @@ class Vector2D:
             raise TypeError("distance_to requires a Vector2D")
         dx = self.x - other.x
         dy = self.y - other.y
-        return math.hypot(dx, dy)
+        return (dx * dx + dy * dy)**0.5
 
     def angle(self):
         """Angle in radians from the positive x-axis to this vector."""
@@ -151,6 +151,179 @@ class Vector2D:
     # Utility: perpendicular (rotated 90 degrees CCW)
     def perpendicular(self):
         return Vector2D(-self.y, self.x)
+
+class Vector3D():
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+    
+    def __repr__(self):
+        return "Vector3D(" + str(self.x) + "," + str(self.y) + "," + str(self.z) + ")"
+    
+    def to_tuple(self):
+        return (self.x, self.y, self.z)
+    
+    def __str__(self):
+        return "("+str(self.x)+", "+str(self.y)+", "+str(self.z)+")"
+    
+    def copy(self):
+        return Vector3D(self.x, self.y, self.z)
+    
+    def __eq__(self, other):
+        if not isinstance(other, Vector3D):
+            return NotImplemented
+        return self.x == other.x and self.y == other.y and self.z == other.z
+    
+    def __add__(self, other):
+        if isinstance(other, Vector3D):
+            return Vector3D(self.x + other.x, self.y + other.y, self.z + other.z)
+        return NotImplemented
+    
+    def __sub__(self, other):
+        if isinstance(other, Vector3D):
+            return Vector3D(self.x - other.x, self.y - other.y, self.z - other.z)
+        return NotImplemented
+    
+    def __mul__(self, other):
+        if isinstance(other, (int, float)):
+            return Vector3D(self.x * other, self.y * other, self.z * other)
+        if isinstance(other, Vector3D):
+            return Vector3D(self.x * other.x, self.y * other.y, self.z * other.z)
+        return NotImplemented
+    
+    def __rmul__(self, other):
+        return self.__mul__(other)
+    
+    def __truediv__(self, other):
+        if isinstance(other, (int, float)):
+            if other == 0:
+                raise ZeroDivisionError("division by zero")
+            return Vector3D(self.x / other, self.y / other, self.z / other)
+        if isinstance(other, Vector3D):
+            if other.x == 0 or other.y == 0 or other.z == 0:
+                raise ZeroDivisionError("element-wise division by zero")
+            return Vector3D(self.x / other.x, self.y / other.y, self.z / other.z)
+        return NotImplemented
+
+    def length_squared(self):
+        return self.x * self.x + self.y * self.y + self.z * self.z
+    
+    def length(self):
+        return (self.x**2 + self.y**2 + self.z**2)**0.5
+    
+    def __abs__(self):
+        return self.length()
+    
+    def normalized(self):
+        l = self.length()
+        if l == 0:
+            return Vector3D(0.0, 0.0, 0.0)
+        return Vector3D(self.x / l, self.y / l, self.z / l)
+    
+    def normalize(self):
+        l = self.length()
+        if l == 0:
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+        else:
+            self.x /= l
+            self.y /= l
+            self.z /= l
+        return self
+    
+    def dot(self, other):
+        if not isinstance(other, Vector3D):
+            raise TypeError("dot requires a Vector3D")
+        return self.x * other.x + self.y * other.y + self.z * other.z
+    
+    def cross(self, other):
+        if not isinstance(other, Vector3D):
+            raise TypeError("cross requires a Vector3D")
+        return Vector3D(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x
+        )
+    
+    def distance_to(self, other):
+        if not isinstance(other, Vector3D):
+            raise TypeError("distance_to requires a Vector3D")
+        dx = self.x - other.x
+        dy = self.y - other.y
+        dz = self.z - other.z
+        return (dx * dx + dy * dy + dz * dz)**0.5
+    
+    def lerp(self, other, t: float):
+        if not isinstance(other, Vector3D):
+            raise TypeError("lerp requires a Vector3D")
+        return Vector3D(
+            self.x + (other.x - self.x) * t,
+            self.y + (other.y - self.y) * t,
+            self.z + (other.z - self.z) * t
+        )
+    
+    def angle_xy(self):
+        return math.atan2(self.y, self.x)
+
+    def angle_xz(self):
+        return math.atan2(self.z, self.x)
+
+    def angle_yz(self):
+        return math.atan2(self.z, self.y)
+    
+    def rotate_around_z(self, angle_radians):
+        c = math.cos(angle_radians)
+        s = math.sin(angle_radians)
+        return Vector3D(
+            self.x * c - self.y * s,
+            self.x * s + self.y * c,
+            self.z
+        )
+    
+    def rotate_around_y(self, angle_radians):
+        c = math.cos(angle_radians)
+        s = math.sin(angle_radians)
+        return Vector3D(
+            self.x * c + self.z * s,
+            self.y,
+            -self.x * s + self.z * c
+        )
+    
+    def rotate_around_x(self, angle_radians):
+        c = math.cos(angle_radians)
+        s = math.sin(angle_radians)
+        return Vector3D(
+            self.x,
+            self.y * c - self.z * s,
+            self.y * s + self.z * c
+        )
+    
+    def rotate(self, angle_x_radians, angle_y_radians, angle_z_radians):
+        v = self.rotate_around_x(angle_x_radians)
+        v = v.rotate_around_y(angle_y_radians)
+        v = v.rotate_around_z(angle_z_radians)
+        return v
+    
+    def perpendicular_xy(self):
+        return Vector3D(-self.y, self.x, self.z)
+    
+    def perpendicular_xz(self):
+        return Vector3D(-self.z, self.y, self.x)
+    
+    def perpendicular_yz(self):
+        return Vector3D(self.x, -self.z, self.y)
+    
+    def perpendicular_rotated_plane(self, plane_normal):
+        if not isinstance(plane_normal, Vector3D):
+            raise TypeError("perpendicular_rotated_plane requires a Vector3D")
+        # Project self onto the plane defined by the normal
+        n = plane_normal.normalized()
+        dot_product = self.dot(n)
+        projected = self - n * dot_product
+        return projected
+    
 
 # logger class
 class LogLine():
@@ -400,8 +573,57 @@ class Intake:
             else:
                 self.motor.spin(FORWARD)
                 self.motor.set_velocity(0, VelocityUnits.PERCENT)
+    def update_manually(self, speed):
+        self.speed = speed
+        self.motor.spin(FORWARD)
+        self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+class AutonomousStep:
+    def __init__(self, left, right, intake_speed, duration):
+        self.left = left
+        self.right = right
+        self.intake_speed = intake_speed
+        self.duration = duration
+
+
+class AutonomousController:
+    def __init__(self, drivecontroller, intake, brain, logger):
+        self.drivecontroller = drivecontroller
+        self.intake = intake
+        self.brain = brain
+        self.logger = logger
+        self.steps = []
+        self.timer = Timer()
+        self.currentstepidx = 0
+        self.completesteptime = 0
+
+    def add_step(self, step):
+        self.steps.append(step)
+    
+    def start(self):
+        self.timer.reset()
+
+    def update(self):
+        if self.currentstepidx >= len(self.steps):
+            # finished
+            self.drivecontroller.update_manually(0, 0)
+            self.intake.update_manually(0)
+            return
+        if self.timer.time() >= self.completesteptime:
+            self.completesteptime += self.steps[self.currentstepidx].duration
+            self.currentstepidx += 1
+        
+        self.drivecontroller.update_manually(self.steps[self.currentstepidx].left, self.steps[self.currentstepidx].right)
+        self.intake.update_manually(self.steps[self.currentstepidx].intake_speed)
+
 
         
+
+def autonomous_start():
+    auton.start()
+    logger.log("Autonomous started.")
+
+def usercontrol_start():
+    logger.log("User control started.")
         
 
 # Brain should be defined by default
@@ -413,26 +635,39 @@ logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
 motor1 = Motor(Ports.PORT1)
 intake = Intake(controller,Motor(Ports.PORT5))
+competition = Competition(usercontrol_start, autonomous_start)
 drivetrain = DriveController([Motor(Ports.PORT1),Motor(Ports.PORT2)],[Motor(Ports.PORT3),Motor(Ports.PORT4)],controller)
+auton = AutonomousController(drivetrain, intake, brain, logger)
+auton.add_step(AutonomousStep(70, 70, 100, 1.5))
 
 # setup UI
 ui = UI(brain)
 ui.add_logger(logger, x=10, y=50, width=480, height=35, num_lines=7)
 ui.add_element(UI_element("button", "VEX Logger UI Demo", x=0, y=0, width=200, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onclick='logger.log("Button clicked!")'))
-ui.add_element(UI_element("button", "", x=200, y=0, width=280, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onupdate='test = "batt:"+str("brain.battery.capacity()")+"%"'))
+ui.add_element(UI_element("button", "", x=200, y=0, width=280, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onupdate='self.content = "batt:"+str("brain.battery.capacity()")+"%"'))
 logger.log("UI initialized.")
 ui.draw()
 
 
 
-test = 0
-time.sleep(2)
+target_framerate = 10
+screenupdatetimer = Timer()
+screenupdatetimer.reset()
 while True:
-    ui.update()
-    ui.draw()
-    drivetrain.update_from_controller()
-    drivetrain.update_motor_speeds()
-    intake.update_from_controller()
-
-    
-
+    if screenupdatetimer.time() > 1/target_framerate:
+        screenupdatetimer.reset()
+        ui.update()
+        ui.draw()
+    if competition.is_enabled() or not(competition.is_competition_switch()):
+        if competition.is_autonomous():
+            auton.update()
+            drivetrain.update_motor_speeds()
+        else:
+            drivetrain.update_from_controller()
+            drivetrain.update_motor_speeds()
+            intake.update_from_controller()
+    else:
+        drivetrain.update_manually(0,0)
+        drivetrain.update_motor_speeds()
+        intake.update_manually(0)
+    time.sleep(0.01) # Sleep to prevent 100% CPU usage
