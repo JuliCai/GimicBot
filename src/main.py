@@ -12,7 +12,7 @@ from vex import *
 import time
 import math
 
-# misc classes
+# vector classes
 class Vector2D:
     """A simple 2D vector with useful magic methods and helpers.
 
@@ -538,7 +538,7 @@ class DriveController():
         # clamp to [-100, 100]
         self.left_speed = max(-100, min(100, left))
         self.right_speed = max(-100, min(100, right))
-        if self.controller.buttonL1.pressing():
+        if self.controller.buttonX.pressing():
             self.left_speed *= 0.5
             self.right_speed *= 0.5
         if self.controller.buttonY.pressing():
@@ -557,6 +557,7 @@ class DriveController():
             right_motor.set_velocity(self.right_speed, VelocityUnits.PERCENT)
             right_motor.spin(FORWARD)
 
+# Intake class
 class Intake:
     def __init__(self, controller, motor):
         self.controller=controller
@@ -577,24 +578,52 @@ class Intake:
         self.speed = speed
         self.motor.spin(FORWARD)
         self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+
+class ButtonControlledMotor:
+    def __init__(self, buttonforward, buttonbackward, motor, speed=100):
+        self.buttonforward = buttonforward
+        self.buttonbackward = buttonbackward
+        self.motor = motor 
+        self.speed = speed
+    def update_from_controller(self):
+        if self.buttonforward.pressing():
+            self.motor.spin(FORWARD)
+            self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+        else:
+            if self.buttonbackward.pressing():
+                self.motor.spin(FORWARD)
+                self.motor.set_velocity(0 - self.speed, VelocityUnits.PERCENT)
+            else:
+                self.motor.spin(FORWARD)
+                self.motor.set_velocity(0, VelocityUnits.PERCENT)
+    def update_manually(self, speed):
+        self.speed = speed
+        self.motor.spin(FORWARD)
+        self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+
+# Autonomous classes
 class AutonomousStep:
-    def __init__(self, left, right, intake_speed, duration):
+    def __init__(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration):
         self.left = left
         self.right = right
         self.intake_speed = intake_speed
+        self.outtake_speed = outtake_speed
+        self.matchloader_speed = matchloader_speed
         self.duration = duration
 
 
 class AutonomousController:
-    def __init__(self, drivecontroller, intake, brain, logger):
+    def __init__(self, drivecontroller, intake, outtake, matchloader, brain, logger):
         self.drivecontroller = drivecontroller
         self.intake = intake
+        self.outtake = outtake
         self.brain = brain
         self.logger = logger
         self.steps = []
         self.timer = Timer()
         self.currentstepidx = 0
         self.completesteptime = 0
+        self.matchloader = matchloader
 
     def add_step(self, step):
         self.steps.append(step)
@@ -607,17 +636,47 @@ class AutonomousController:
             # finished
             self.drivecontroller.update_manually(0, 0)
             self.intake.update_manually(0)
+            self.outtake.update_manually(0)
+            self.matchloader.update_manually(0)
             return
+
         if self.timer.time() >= self.completesteptime:
             self.completesteptime += self.steps[self.currentstepidx].duration
             self.currentstepidx += 1
+
+            if self.currentstepidx >= len(self.steps):
+                # finished
+                self.drivecontroller.update_manually(0, 0)
+                self.intake.update_manually(0)
+                self.outtake.update_manually(0)
+                self.matchloader.update_manually(0)
+                return
+
+        step = self.steps[self.currentstepidx]
+        self.drivecontroller.update_manually(step.left, step.right)
+        self.intake.update_manually(step.intake_speed)
+        self.outtake.update_manually(step.outtake_speed)
+        self.matchloader.update_manually(step.matchloader_speed)
+
+class WrappedButton:
+    def __init__(self, button):
+        self.button = button
+        self.last_state = False
+        self.state = False
+    def pressing(self):
+        return self.state
+    def releasing(self):
+        return not self.state
+    def pressed(self):
+        return self.state and not self.last_state
+    def released(self):
+        return not self.state and self.last_state
+    def raw_pressing(self):
+        return self.button.pressing()
+    def update_state(self):
+        self.last_state = self.state
+        self.state = self.button.pressing()
         
-        self.drivecontroller.update_manually(self.steps[self.currentstepidx].left, self.steps[self.currentstepidx].right)
-        self.intake.update_manually(self.steps[self.currentstepidx].intake_speed)
-
-
-        
-
 def autonomous_start():
     auton.start()
     logger.log("Autonomous started.")
@@ -629,22 +688,26 @@ def usercontrol_start():
 # Brain should be defined by default
 brain=Brain()
 controller = Controller()
+secret_button = WrappedButton(controller.buttonUp)
 brain.screen.set_pen_color(Color.WHITE)
 brain.screen.render()
 logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
 motor1 = Motor(Ports.PORT1)
 intake = Intake(controller,Motor(Ports.PORT5))
+outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
+matchloader = ButtonControlledMotor(controller.buttonB, controller.buttonA, Motor(Ports.PORT8), speed=50)
 competition = Competition(usercontrol_start, autonomous_start)
-drivetrain = DriveController([Motor(Ports.PORT1),Motor(Ports.PORT2)],[Motor(Ports.PORT3),Motor(Ports.PORT4)],controller)
-auton = AutonomousController(drivetrain, intake, brain, logger)
-auton.add_step(AutonomousStep(70, 70, 100, 1.5))
+drivetrain = DriveController([Motor(Ports.PORT1),Motor(Ports.PORT2)],[Motor(Ports.PORT6),Motor(Ports.PORT4)],controller)
 
+auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger)
+# autonomous steps. Format: left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
+auton.add_step(AutonomousStep(70, 70, 100, 0, 20, 1.5))
 # setup UI
 ui = UI(brain)
 ui.add_logger(logger, x=10, y=50, width=480, height=35, num_lines=7)
-ui.add_element(UI_element("button", "VEX Logger UI Demo", x=0, y=0, width=200, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onclick='logger.log("Button clicked!")'))
-ui.add_element(UI_element("button", "", x=200, y=0, width=280, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onupdate='self.content = "batt:"+str("brain.battery.capacity()")+"%"'))
+ui.add_element(UI_element("button", "Grayson Gimic Bot", x=0, y=0, width=200, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onclick='logger.log("Button clicked!")'))
+ui.add_element(UI_element("button", "", x=200, y=0, width=280, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onupdate='self.content = "batt:" + str(brain.battery.capacity()) + "%"'))
 logger.log("UI initialized.")
 ui.draw()
 
@@ -658,6 +721,9 @@ while True:
         screenupdatetimer.reset()
         ui.update()
         ui.draw()
+        secret_button.update_state()
+        if secret_button.pressed():
+            logger.log("OMG you did it! You found the secret button!")
     if competition.is_enabled() or not(competition.is_competition_switch()):
         if competition.is_autonomous():
             auton.update()
@@ -666,8 +732,12 @@ while True:
             drivetrain.update_from_controller()
             drivetrain.update_motor_speeds()
             intake.update_from_controller()
+            outtake.update_from_controller()
+            matchloader.update_from_controller()
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
         intake.update_manually(0)
+        outtake.update_manually(0)
+        matchloader.update_manually(0)
     time.sleep(0.01) # Sleep to prevent 100% CPU usage
