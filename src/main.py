@@ -9,6 +9,7 @@
 
 # Library imports
 from vex import *
+import vex
 import time
 import math
 
@@ -547,7 +548,7 @@ class DriveController():
     
     def update_manually(self, left, right):
         self.left_speed = max(-100, min(100, left))
-        self.right_speed = max(-100, min(100, right))
+        self.right_speed = max(-100, min(100, 0-right))
 
     def update_motor_speeds(self):
         for left_motor in self.left_motors:
@@ -563,53 +564,88 @@ class Intake:
         self.controller=controller
         self.motor = motor
         self.speed = 100
+    def _apply_speed(self, speed):
+        if speed == 0:
+            self.motor.stop()
+            return
+        direction = FORWARD if speed > 0 else REVERSE
+        self.motor.set_velocity(abs(speed), VelocityUnits.PERCENT)
+        self.motor.spin(direction)
     def update_from_controller(self):
         if self.controller.buttonR1.pressing():
-            self.motor.spin(FORWARD)
-            self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+            self._apply_speed(self.speed)
         else:
             if self.controller.buttonR2.pressing():
-                self.motor.spin(FORWARD)
-                self.motor.set_velocity(0-self.speed, VelocityUnits.PERCENT)
+                self._apply_speed(0-self.speed)
             else:
-                self.motor.spin(FORWARD)
-                self.motor.set_velocity(0, VelocityUnits.PERCENT)
+                self._apply_speed(0)
     def update_manually(self, speed):
-        self.speed = speed
-        self.motor.spin(FORWARD)
-        self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+        self._apply_speed(speed)
 
 class ButtonControlledMotor:
-    def __init__(self, buttonforward, buttonbackward, motor, speed=100):
+    def __init__(self, buttonforward, buttonbackward, motor, speed=100, mode = "direct", params=None):
         self.buttonforward = buttonforward
         self.buttonbackward = buttonbackward
         self.motor = motor 
         self.speed = speed
+        self.mode = mode
+        self.params = params or {}
+        self.toggle_state = None
+        if self.mode == "toggle":
+            position_a = self.params.get("position_a")
+            position_b = self.params.get("position_b")
+            if position_a is None or position_b is None:
+                raise ValueError("toggle mode requires position_a and position_b params")
+            initial_state = self.params.get("initial_state", "b")
+            self.toggle_state = Toggled(position_a, position_b, initial_state)
+            self._apply_toggle_target()
+    def _apply_speed(self, speed):
+        if speed == 0:
+            self.motor.stop()
+            return
+        direction = FORWARD if speed > 0 else REVERSE
+        self.motor.set_velocity(abs(speed), VelocityUnits.PERCENT)
+        self.motor.spin(direction)
+    def _apply_toggle_target(self):
+        if self.toggle_state is None:
+            return
+        target = self.toggle_state.get_value()
+        self.motor.spin_to_position(target, RotationUnits.DEG, self.speed, VelocityUnits.PERCENT, wait=False)
+    def set_toggle_state(self, state, force=False):
+        if self.mode != "toggle" or self.toggle_state is None:
+            raise RuntimeError("set_toggle_state is only available in toggle mode")
+        changed = self.toggle_state.set_state(state)
+        if changed or force:
+            self._apply_toggle_target()
     def update_from_controller(self):
-        if self.buttonforward.pressing():
-            self.motor.spin(FORWARD)
-            self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
-        else:
-            if self.buttonbackward.pressing():
-                self.motor.spin(FORWARD)
-                self.motor.set_velocity(0 - self.speed, VelocityUnits.PERCENT)
+        if self.mode == "direct":
+            if self.buttonforward.pressing():
+                self._apply_speed(self.speed)
             else:
-                self.motor.spin(FORWARD)
-                self.motor.set_velocity(0, VelocityUnits.PERCENT)
+                if self.buttonbackward.pressing():
+                    self._apply_speed(0 - self.speed)
+                else:
+                    self._apply_speed(0)
+        if self.mode == "toggle" and self.toggle_state is not None:
+            if self.buttonforward.pressing():
+                if self.toggle_state.set_state("a"):
+                    self._apply_toggle_target()
+            if self.buttonbackward.pressing():
+                if self.toggle_state.set_state("b"):
+                    self._apply_toggle_target()
     def update_manually(self, speed):
-        self.speed = speed
-        self.motor.spin(FORWARD)
-        self.motor.set_velocity(self.speed, VelocityUnits.PERCENT)
+        self._apply_speed(speed)
 
 # Autonomous classes
 class AutonomousStep:
-    def __init__(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration):
+    def __init__(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state=None):
         self.left = left
         self.right = right
         self.intake_speed = intake_speed
         self.outtake_speed = outtake_speed
         self.matchloader_speed = matchloader_speed
         self.duration = duration
+        self.matchloader_toggle_state = matchloader_toggle_state
 
 
 class AutonomousController:
@@ -630,6 +666,11 @@ class AutonomousController:
     
     def start(self):
         self.timer.reset()
+        self.currentstepidx = 0
+        if self.steps:
+            self.completesteptime = self.steps[0].duration
+        else:
+            self.completesteptime = 0
 
     def update(self):
         if self.currentstepidx >= len(self.steps):
@@ -640,7 +681,9 @@ class AutonomousController:
             self.matchloader.update_manually(0)
             return
 
-        if self.timer.time() >= self.completesteptime:
+        # VEX Timer.time defaults to milliseconds, so ask for seconds to match
+        # the step durations we store.
+        if self.timer.time(vex.TimeUnits.SECONDS) >= self.completesteptime:
             self.completesteptime += self.steps[self.currentstepidx].duration
             self.currentstepidx += 1
 
@@ -656,7 +699,13 @@ class AutonomousController:
         self.drivecontroller.update_manually(step.left, step.right)
         self.intake.update_manually(step.intake_speed)
         self.outtake.update_manually(step.outtake_speed)
-        self.matchloader.update_manually(step.matchloader_speed)
+        if step.matchloader_toggle_state is not None and getattr(self.matchloader, "mode", None) == "toggle":
+            try:
+                self.matchloader.set_toggle_state(step.matchloader_toggle_state)
+            except RuntimeError:
+                self.matchloader.update_manually(step.matchloader_speed)
+        else:
+            self.matchloader.update_manually(step.matchloader_speed)
 
 class WrappedButton:
     def __init__(self, button):
@@ -676,6 +725,39 @@ class WrappedButton:
     def update_state(self):
         self.last_state = self.state
         self.state = self.button.pressing()
+
+class Toggled:
+    """Utility to keep a two-state value in sync across subsystems."""
+    def __init__(self, value_a, value_b, initial_state="a"):
+        self.value_a = value_a
+        self.value_b = value_b
+        self.state = self._normalize_state(initial_state)
+
+    def _normalize_state(self, state):
+        if isinstance(state, bool):
+            return "a" if state else "b"
+        if isinstance(state, str):
+            lowered = state.lower()
+            if lowered in ("a", "b"):
+                return lowered
+        raise ValueError("Toggle state must be 'a', 'b', True, or False")
+
+    def set_state(self, state):
+        normalized = self._normalize_state(state)
+        changed = normalized != self.state
+        self.state = normalized
+        return changed
+
+    def toggle(self):
+        next_state = "b" if self.state == "a" else "a"
+        self.state = next_state
+        return self.state
+
+    def get_value(self):
+        return self.value_a if self.state == "a" else self.value_b
+
+    def get_state(self):
+        return self.state
         
 def autonomous_start():
     auton.start()
@@ -696,13 +778,14 @@ logger.log("Logger initialized.")
 motor1 = Motor(Ports.PORT1)
 intake = Intake(controller,Motor(Ports.PORT5))
 outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
-matchloader = ButtonControlledMotor(controller.buttonB, controller.buttonA, Motor(Ports.PORT8), speed=50)
+matchloader = ButtonControlledMotor(controller.buttonB, controller.buttonA, Motor(Ports.PORT8), speed=100, params={"position_a": 700, "position_b": 0}, mode="toggle")
 competition = Competition(usercontrol_start, autonomous_start)
 drivetrain = DriveController([Motor(Ports.PORT1),Motor(Ports.PORT2)],[Motor(Ports.PORT6),Motor(Ports.PORT4)],controller)
 
 auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger)
 # autonomous steps. Format: left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
-auton.add_step(AutonomousStep(70, 70, 100, 0, 20, 1.5))
+auton.add_step(AutonomousStep(30, 30, -100, 50, 0, 2, matchloader_toggle_state="b"))
+auton.add_step(AutonomousStep(0, 0, -100, 50, 0, 5, matchloader_toggle_state="b"))
 # setup UI
 ui = UI(brain)
 ui.add_logger(logger, x=10, y=50, width=480, height=35, num_lines=7)
