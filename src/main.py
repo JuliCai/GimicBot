@@ -636,6 +636,24 @@ class ButtonControlledMotor:
     def update_manually(self, speed):
         self._apply_speed(speed)
 
+class ButtonControlledPneumatic:
+    def __init__(self, buttontoggle, piston):
+        self.buttontoggle = WrappedButton(buttontoggle)
+        self.piston = piston
+        self.toggle_state = Toggled("a", "b", initial_state="b")
+        if self.toggle_state.state == "a":
+            self.piston.open()
+        else:
+            self.piston.close()
+    def update_from_controller(self):
+        self.buttontoggle.update_state()
+        if self.buttontoggle.pressed():
+            new_state = self.toggle_state.toggle()
+            if new_state == "a":
+                self.piston.open()
+            else:
+                self.piston.close()
+
 # Autonomous classes
 class AutonomousStep:
     def __init__(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state=None):
@@ -775,6 +793,7 @@ brain.screen.set_pen_color(Color.WHITE)
 brain.screen.render()
 logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
+testpneumatic = ButtonControlledPneumatic(controller.buttonLeft, Pneumatics(brain.three_wire_port.a))
 motor1 = Motor(Ports.PORT1)
 intake = Intake(controller,Motor(Ports.PORT5))
 outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
@@ -817,6 +836,7 @@ while True:
             intake.update_from_controller()
             outtake.update_from_controller()
             matchloader.update_from_controller()
+            testpneumatic.update_from_controller()
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
