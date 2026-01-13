@@ -843,4 +843,4 @@ while True:
         intake.update_manually(0)
         outtake.update_manually(0)
         matchloader.update_manually(0)
-    time.sleep(0.01) # Sleep to prevent 100% CPU usage
+    time.sleep(0.01) # Sleep to prevent unnecessary 100% CPU usage
