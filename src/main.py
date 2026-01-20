@@ -6,7 +6,6 @@
 # 	Description:  V5 project                                                   #
 #                                                                              #
 # ---------------------------------------------------------------------------- #
-
 # Library imports
 from vex import *
 import vex
@@ -513,6 +512,13 @@ class DriveController():
         self.controller = controller
         self.left_speed = 0
         self.right_speed = 0
+        # Tunable inversion flags so field fixes don't require rewiring
+        # forward_sign: 1 keeps existing axis3 behavior, -1 flips forward/back
+        # turn_sign: 1 keeps existing axis4 behavior, -1 flips turn direction
+        # right_side_sign: 1 if motors are mounted/reversed in code, -1 if they need inversion
+        self.forward_sign = -1  # flip forward/back to correct the observed inversion
+        self.turn_sign = -1     # flip turn direction to restore normal turning
+        self.right_side_sign = -1  # preserve prior right-side inversion
 
     def get_joystick_input(self):
         # Treat x as the horizontal (turn) axis and y as the forward/back axis.
@@ -521,20 +527,16 @@ class DriveController():
         return Vector2D(self.controller.axis4.position(), self.controller.axis3.position())
     
     def update_from_controller(self):
-        # Standard arcade/differential mapping:
-        # forward = input.y, turn = input.x
-        # left = forward + turn
-        # right = forward - turn
+        # Arcade drive: axis3 = forward/back, axis4 = turn
         js = self.get_joystick_input()
-        forward = js.length()
-        if js.y <0:
-            forward = 0-forward
-        turn = js.x*-2
-        
+        forward = self.forward_sign * js.y
+        turn = self.turn_sign * js.x
 
         left = forward + turn
         right = forward - turn
-        right = 0-right
+
+        # Apply right-side inversion if hardware needs it
+        right *= self.right_side_sign
 
         # clamp to [-100, 100]
         self.left_speed = max(-100, min(100, left))
@@ -794,12 +796,15 @@ brain.screen.render()
 logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
 testpneumatic = ButtonControlledPneumatic(controller.buttonLeft, Pneumatics(brain.three_wire_port.a))
-motor1 = Motor(Ports.PORT1)
-intake = Intake(controller,Motor(Ports.PORT5))
+intake = Intake(controller, Motor(Ports.PORT9))
 outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
 matchloader = ButtonControlledMotor(controller.buttonB, controller.buttonA, Motor(Ports.PORT8), speed=100, params={"position_a": 700, "position_b": 0}, mode="toggle")
 competition = Competition(usercontrol_start, autonomous_start)
-drivetrain = DriveController([Motor(Ports.PORT1),Motor(Ports.PORT2)],[Motor(Ports.PORT6),Motor(Ports.PORT4)],controller)
+drivetrain = DriveController(
+    [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
+    [Motor(Ports.PORT1), Motor(Ports.PORT2), Motor(Ports.PORT3)],
+    controller,
+)
 
 auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger)
 # autonomous steps. Format: left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
