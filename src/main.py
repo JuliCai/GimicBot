@@ -1404,6 +1404,12 @@ target_framerate = 10
 screenupdatetimer = Timer()
 screenupdatetimer.reset()
 
+# Dedicated timer for consistent recording/playback frame rate
+# Both record and playback advance one frame per FRAME_INTERVAL so timing stays 1:1
+FRAME_INTERVAL = 0.02  # 20ms per frame = 50 FPS
+frame_timer = Timer()
+frame_timer.reset()
+
 # Helper variables for tracking motor states during recording
 last_intake_speed = 0
 last_outtake_speed = 0
@@ -1434,14 +1440,22 @@ while True:
                 show_save_slot_ui()
             else:
                 move_recorder.start_recording()
+                frame_timer.reset()
                 logger.log("Recording started! Press left arrow to stop.")
     
+    # Check if a consistent frame tick has elapsed for recording/playback
+    frame_tick = frame_timer.time(vex.TimeUnits.SECONDS) >= FRAME_INTERVAL
+    if frame_tick:
+        frame_timer.reset()
+
     if competition.is_enabled() or not(competition.is_competition_switch()):
         if competition.is_autonomous():
-            auton.update()
+            if frame_tick:
+                auton.update()
             drivetrain.update_motor_speeds()
         elif auton_manager.playback_mode:
-            auton.update()
+            if frame_tick:
+                auton.update()
             drivetrain.update_motor_speeds()
             if auton.mode == "movestring" and auton.playback_idx >= len(auton.playback_frames):
                 auton_manager.stop_playback()
@@ -1454,7 +1468,7 @@ while True:
             matchloader.update_from_controller()
             descore.update_from_controller()
             
-            if move_recorder.recording:
+            if move_recorder.recording and frame_tick:
                 if controller.buttonR1.pressing():
                     current_intake = intake.speed
                 elif controller.buttonR2.pressing():
@@ -1469,7 +1483,6 @@ while True:
                 else:
                     current_outtake = 0
                 
-                # Matchloader is now a pneumatic - record state as 100 (extended) or 0 (retracted)
                 current_matchloader = 100 if matchloader.toggle_state.state == "a" else 0
                 
                 current_pneumatic = descore.toggle_state.state == "a"
