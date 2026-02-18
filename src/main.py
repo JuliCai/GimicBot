@@ -1165,6 +1165,7 @@ class GPSSensor:
     def __init__(self, sensor):
         self.sensor = sensor
         self.last_valid_position = (0, 0)
+        self.last_valid_gyro_z = 0
     def get_position(self):
         try:
             position = self.sensor.position()
@@ -1172,6 +1173,14 @@ class GPSSensor:
             return position
         except Exception:
             return None
+    def get_internal_gyro_z(self):
+        """get internal stuff with gps_sensor.orientation(axis, units)"""
+        try:
+            orientation = self.sensor.orientation(vex.OrientationType.YAW, vex.RotationUnits.DEG)
+            self.last_valid_gyro_z = orientation
+            return orientation
+        except Exception:
+            return self.last_valid_gyro_z
     def get_accurate_reading(self, samples=5, delay_ms=100):
         """Get an averaged GPS reading to reduce noise."""
         x_total = 0
