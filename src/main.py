@@ -329,9 +329,10 @@ class Vector3D():
 class MoveRecorder:
     """Records controller inputs directly to SD card for playback.
     
-    Binary format (MR3): 4-byte header "MR3:" + 6 bytes per frame
-    Each frame: left, right, intake, outtake, matchloader, pneumatic
-    Values stored as unsigned bytes with +128 offset (so -100 = 28, 0 = 128, 100 = 228)
+    Binary format (MR4): 4-byte header "MR4:" + 14 bytes per frame
+    Each frame: left, right, intake, outtake, matchloader, pneumatic, left_pos_deg, right_pos_deg
+    Control values are unsigned bytes with +128 offset (so -100 = 28, 0 = 128, 100 = 228)
+    Positions are signed 32-bit integers in degrees (relative to recording start)
     """
     
     TEMP_FILE = "recording_temp.bin"
@@ -341,15 +342,20 @@ class MoveRecorder:
         self.recording = False
         self.frame_count = 0
         self.frame_buffer = bytearray()  # Small buffer to batch writes
-        self.buffer_size = 60  # Write every 10 frames (60 bytes)
+        self.frame_size = 14
+        self.buffer_size = self.frame_size * 10  # Write every 10 frames
+        self.left_origin_deg = None
+        self.right_origin_deg = None
     
     def start_recording(self):
         """Start recording - creates temp file with header."""
         self.recording = True
         self.frame_count = 0
         self.frame_buffer = bytearray()
+        self.left_origin_deg = None
+        self.right_origin_deg = None
         # Write header to temp file
-        self.brain.sdcard.savefile(self.TEMP_FILE, bytearray("MR3:", "utf-8"))
+        self.brain.sdcard.savefile(self.TEMP_FILE, bytearray("MR4:", "utf-8"))
     
     def stop_recording(self):
         """Stop recording - flush remaining buffer."""
@@ -360,7 +366,7 @@ class MoveRecorder:
             self.frame_buffer = bytearray()
         return self.frame_count
     
-    def record_frame(self, left, right, intake_speed, outtake_speed, matchloader_speed, pneumatic_state):
+    def record_frame(self, left, right, intake_speed, outtake_speed, matchloader_speed, pneumatic_state, left_pos_deg=None, right_pos_deg=None):
         """Record a single frame - buffers and writes to SD periodically."""
         if not self.recording:
             return
@@ -369,14 +375,59 @@ class MoveRecorder:
         def to_byte(val):
             clamped = max(-128, min(127, int(round(val))))
             return (clamped + 128) & 0xFF
+
+        def to_int_compat(val):
+            """Convert VEX numeric-ish values to plain Python int safely."""
+            try:
+                return int(val)
+            except Exception:
+                try:
+                    return int(float(val))
+                except Exception:
+                    return 0
+
+        def append_i32(buffer, val):
+            # Avoid int.to_bytes for better compatibility with VEX Python runtime.
+            as_int = to_int_compat(val)
+            if as_int > 2147483647:
+                as_int = 2147483647
+            if as_int < -2147483648:
+                as_int = -2147483648
+            if as_int < 0:
+                as_int = (1 << 32) + as_int
+            bytes4 = bytearray(4)
+            bytes4[0] = as_int & 0xFF
+            bytes4[1] = (as_int >> 8) & 0xFF
+            bytes4[2] = (as_int >> 16) & 0xFF
+            bytes4[3] = (as_int >> 24) & 0xFF
+            buffer.extend(bytes4)
+
+        if left_pos_deg is not None:
+            left_pos_deg = to_int_compat(left_pos_deg)
+        if right_pos_deg is not None:
+            right_pos_deg = to_int_compat(right_pos_deg)
+
+        if left_pos_deg is not None and self.left_origin_deg is None:
+            self.left_origin_deg = left_pos_deg
+        if right_pos_deg is not None and self.right_origin_deg is None:
+            self.right_origin_deg = right_pos_deg
+
+        left_pos_rel = 0
+        right_pos_rel = 0
+        if left_pos_deg is not None and self.left_origin_deg is not None:
+            left_pos_rel = left_pos_deg - self.left_origin_deg
+        if right_pos_deg is not None and self.right_origin_deg is not None:
+            right_pos_rel = right_pos_deg - self.right_origin_deg
         
-        # Add frame to buffer (6 bytes)
+        # Add frame to buffer (14 bytes)
         self.frame_buffer.append(to_byte(left))
         self.frame_buffer.append(to_byte(right))
         self.frame_buffer.append(to_byte(intake_speed))
         self.frame_buffer.append(to_byte(outtake_speed))
         self.frame_buffer.append(to_byte(matchloader_speed))
         self.frame_buffer.append(1 if pneumatic_state else 0)
+        append_i32(self.frame_buffer, left_pos_rel)
+        append_i32(self.frame_buffer, right_pos_rel)
         
         self.frame_count += 1
         
@@ -411,6 +462,8 @@ class MoveRecorder:
         
         if header_str == "MR3:":
             return MoveRecorder._parse_mr3(data)
+        elif header_str == "MR4:":
+            return MoveRecorder._parse_mr4(data)
         elif header_str == "MR2:":
             # Legacy text format
             try:
@@ -448,6 +501,42 @@ class MoveRecorder:
             frames.append(frame)
             idx += 6
         
+        return frames
+
+    @staticmethod
+    def _parse_mr4(data):
+        """Parse MR4 binary format with drivetrain position data."""
+        frames = []
+        idx = 4
+
+        def from_byte(b):
+            return b - 128
+
+        def from_i32(buf, start):
+            raw = (
+                buf[start]
+                | (buf[start + 1] << 8)
+                | (buf[start + 2] << 16)
+                | (buf[start + 3] << 24)
+            )
+            if raw >= (1 << 31):
+                raw -= (1 << 32)
+            return raw
+
+        while idx + 14 <= len(data):
+            frame = (
+                from_byte(data[idx]),
+                from_byte(data[idx + 1]),
+                from_byte(data[idx + 2]),
+                from_byte(data[idx + 3]),
+                from_byte(data[idx + 4]),
+                data[idx + 5],  # pneumatic is 0/1, no offset
+                from_i32(data, idx + 6),
+                from_i32(data, idx + 10),
+            )
+            frames.append(frame)
+            idx += 14
+
         return frames
     
     @staticmethod
@@ -525,16 +614,20 @@ class MoveRecorder:
 # Autonomous file manager for SD card save/load
 class AutonomousManager:
     """Manages saving, loading, and selecting autonomous routines from SD card."""
+    RECORDING_SLOT_MIN = 1
+    RECORDING_SLOT_MAX = 4
+    STEPS_SLOT = 5
     
     def __init__(self, brain, logger, auton_controller):
         self.brain = brain
         self.logger = logger
         self.auton = auton_controller
-        self.selected_slot = 1  # Default to slot 1
+        self.selected_slot = self.STEPS_SLOT  # Default to built-in steps routine
         self.config_mode = False
         self.save_mode = False  # True when showing save slot buttons
         self.playback_mode = False  # True when playing back in config mode
         self._load_selected_slot()
+        self._apply_selected_slot()
     
     def _get_auton_filepath(self, slot):
         """Get the filepath for an autonomous slot."""
@@ -551,7 +644,7 @@ class AutonomousManager:
     def _load_selected_slot(self):
         """Load the selected autonomous slot from SD card."""
         if not self._sd_available():
-            self.logger.warn("No SD card - using defaults")
+            self.logger.warn("No SD card - using slot 5 (steps)")
             return
         try:
             data = self.brain.sdcard.loadfile(self._get_selected_filepath())
@@ -559,27 +652,47 @@ class AutonomousManager:
                 content = bytes(data).decode("utf-8").strip()
                 if content.isdigit():
                     slot = int(content)
-                    if 1 <= slot <= 4:
+                    if self.RECORDING_SLOT_MIN <= slot <= self.STEPS_SLOT:
                         self.selected_slot = slot
                         self.logger.log("Loaded auton slot: " + str(slot))
-                        self._load_auton_from_slot(slot)
         except:
-            self.logger.log("No saved auton selection, using slot 1")
+            self.logger.log("No saved auton selection, using slot 5")
     
     def _save_selected_slot(self, slot):
         """Save the selected autonomous slot to SD card."""
+        self.selected_slot = slot
         if not self._sd_available():
-            self.logger.error("No SD card!")
+            self.logger.warn("No SD card - selection kept in memory")
             return
         try:
             self.brain.sdcard.savefile(self._get_selected_filepath(), bytearray(str(slot), "utf-8"))
-            self.selected_slot = slot
             self.logger.log("Saved auton selection: slot " + str(slot))
         except Exception as e:
             self.logger.error("Failed to save selection: " + str(e))
+
+    def _apply_steps_slot(self):
+        self.auton.use_steps_mode()
+        count = len(self.auton.steps)
+        self.logger.log("Selected slot 5 (steps, " + str(count) + " steps)")
+
+    def _apply_selected_slot(self):
+        if self.selected_slot == self.STEPS_SLOT:
+            self._apply_steps_slot()
+            return True
+        loaded = self._load_auton_from_slot(self.selected_slot)
+        if loaded:
+            return True
+
+        self.logger.warn("Slot " + str(self.selected_slot) + " is empty - using slot 5 (steps)")
+        self.selected_slot = self.STEPS_SLOT
+        self._apply_steps_slot()
+        return False
     
     def _load_auton_from_slot(self, slot):
         """Load an autonomous routine from a slot file."""
+        if slot == self.STEPS_SLOT:
+            self._apply_steps_slot()
+            return True
         if not self._sd_available():
             self.logger.error("No SD card!")
             return False
@@ -619,6 +732,8 @@ class AutonomousManager:
     
     def slot_has_data(self, slot):
         """Check if a slot has a saved autonomous."""
+        if slot == self.STEPS_SLOT:
+            return True
         if not self._sd_available():
             return False
         filepath = self._get_auton_filepath(slot)
@@ -646,6 +761,13 @@ class AutonomousManager:
     
     def start_playback(self, slot):
         """Start playing back an autonomous for testing."""
+        if slot == self.STEPS_SLOT:
+            self.auton.use_steps_mode()
+            self.playback_mode = True
+            self.auton.start()
+            self.logger.log("Playing slot 5 (steps)...")
+            return
+
         if self._load_auton_from_slot(slot):
             self.playback_mode = True
             self.auton.start()
@@ -661,7 +783,7 @@ class AutonomousManager:
     def select_slot(self, slot):
         """Select a slot as the active autonomous for competition."""
         self._save_selected_slot(slot)
-        self._load_auton_from_slot(slot)
+        self._apply_selected_slot()
 
 
 # logger class
@@ -871,6 +993,11 @@ class DriveController():
         self.forward_sign = -1  # flip forward/back to correct the observed inversion
         self.turn_sign = -1     # flip turn direction to restore normal turning
         self.right_side_sign = -1  # preserve prior right-side inversion
+        self.front_flipped = False
+        # Per-motor continuous position tracking to handle wrapped encoder angles.
+        # Some runtimes return motor.position() modulo 360; unwrapping prevents
+        # ±360 jumps that destabilize proportional playback correction.
+        self._motor_pos_state = {}
 
     def get_joystick_input(self):
         # Treat x as the horizontal (turn) axis and y as the forward/back axis.
@@ -880,13 +1007,25 @@ class DriveController():
             return Vector2D(self.controller.axis4.position(), self.controller.axis3.position())
         elif self.controltype == "tank":
             return Vector2D(self.controller.axis1.position(), self.controller.axis3.position())
+        return Vector2D(0, 0)
             
     
     def update_from_controller(self):
         # Arcade drive: axis3 = forward/back, axis4 = turn
         js = self.get_joystick_input()
+
+        # deadzone
+        if js.length() < 10:
+            js = Vector2D(0, 0)
+
         forward = self.forward_sign * js.y
         turn = self.turn_sign * js.x
+
+        # In flipped mode, invert both forward and turning inputs so controls
+        # remain intuitive from the opposite end of the robot.
+        if self.front_flipped:
+            forward = -forward
+            turn = turn
 
         left = forward + turn
         right = forward - turn
@@ -903,6 +1042,10 @@ class DriveController():
         if self.controller.buttonY.pressing():
             self.left_speed *= 0.25
             self.right_speed *= 0.25
+
+    def toggle_front(self):
+        self.front_flipped = not self.front_flipped
+        return self.front_flipped
     
     def update_manually(self, left, right):
         self.left_speed = max(-100, min(100, left))
@@ -915,6 +1058,161 @@ class DriveController():
         for right_motor in self.right_motors:
             right_motor.set_velocity(self.right_speed, VelocityUnits.PERCENT)
             right_motor.spin(FORWARD)
+
+    def _safe_motor_position_degrees(self, motor):
+        """Get motor position in degrees without raising runtime errors."""
+        pos = 0
+        try:
+            pos = motor.position(vex.RotationUnits.DEG)
+        except Exception:
+            try:
+                pos = motor.position(DEGREES)
+            except Exception:
+                try:
+                    pos = motor.position()
+                except Exception:
+                    pos = 0
+        try:
+            return int(pos)
+        except Exception:
+            try:
+                return int(float(pos))
+            except Exception:
+                return 0
+
+    def _continuous_motor_position_degrees(self, motor):
+        """Get a continuous (unwrapped) motor position in degrees."""
+        raw_pos = self._safe_motor_position_degrees(motor)
+        key = id(motor)
+        state = self._motor_pos_state.get(key)
+
+        if state is None:
+            self._motor_pos_state[key] = {"last_raw": raw_pos, "continuous": raw_pos}
+            return raw_pos
+
+        delta = raw_pos - state["last_raw"]
+        # Unwrap around 360-degree boundaries.
+        if delta > 180:
+            delta -= 360
+        elif delta < -180:
+            delta += 360
+
+        state["continuous"] += delta
+        state["last_raw"] = raw_pos
+        return state["continuous"]
+
+    def get_drive_positions_degrees(self):
+        """Return average left/right drive positions in degrees."""
+        left_avg = 0
+        right_avg = 0
+        if len(self.left_motors) > 0:
+            left_avg = sum(self._continuous_motor_position_degrees(motor) for motor in self.left_motors) / len(self.left_motors)
+        if len(self.right_motors) > 0:
+            right_avg = sum(self._continuous_motor_position_degrees(motor) for motor in self.right_motors) / len(self.right_motors)
+        return left_avg, right_avg
+    
+    def get_motor_speeds(self):
+        leftspeedsum = 0
+        for motor in self.left_motors:
+            try:
+                leftspeedsum += motor.velocity(vex.VelocityUnits.DPS)
+            except Exception:
+                try:
+                    leftspeedsum += motor.velocity(vex.VelocityUnits.DPS)
+                except Exception:
+                    leftspeedsum += 0
+        rightspeedsum = 0
+        for motor in self.right_motors:
+            try:
+                rightspeedsum += motor.velocity(vex.VelocityUnits.DPS)
+            except Exception:
+                try:
+                    rightspeedsum += motor.velocity(vex.VelocityUnits.DPS)
+                except Exception:
+                    rightspeedsum += 0
+        leftspeed = 0
+        rightspeed = 0
+        if len(self.left_motors) > 0:
+            leftspeed = leftspeedsum / len(self.left_motors)
+        if len(self.right_motors) > 0:
+            rightspeed = rightspeedsum / len(self.right_motors)
+        return leftspeed, rightspeed
+
+    
+    def get_velocity_real(self):
+        """Estimate current velocity in m/s and z rotation of robot in deg/s based on motor speeds."""
+        wheel_diameter_mm = 83
+        drivetrain_width_mm = 300 # wrong, will adjust, just prototype of code
+        wheel_circumference_mm = wheel_diameter_mm * math.pi
+        gearratio = 48/36 #speed at motor * gearratio = speed at wheel
+        left_speed_dps, right_speed_dps = self.get_motor_speeds()
+        left_speed_mps = (left_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
+        right_speed_mps = (right_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
+        forward_speed = (left_speed_mps + right_speed_mps) / 2
+        rotation_z_speed = (right_speed_mps - left_speed_mps) / (drivetrain_width_mm / 1000) * (180 / math.pi)
+        return forward_speed, rotation_z_speed
+
+
+"""TODO: KalmanFilter class, uses GPS and Drivetrain odometry to produce a more accurate position estimate"""
+class KalmanFilter:
+    def __init__(self):
+        pass
+    """¯\_(ツ)_/¯ idk how"""
+
+
+"""TODO: GPS class"""
+class GPSSensor:
+    def __init__(self, sensor):
+        self.sensor = sensor
+        self.last_valid_position = (0, 0)
+    def get_position(self):
+        try:
+            position = self.sensor.position()
+            self.last_valid_position = position
+            return position
+        except Exception:
+            return None
+    def get_accurate_reading(self, samples=5, delay_ms=100):
+        """Get an averaged GPS reading to reduce noise."""
+        x_total = 0
+        y_total = 0
+        valid_samples = 0
+        for _ in range(samples):
+            pos = self.get_position()
+            if pos is not None:
+                x_total += pos.x
+                y_total += pos.y
+                valid_samples += 1
+            vex.sleep(delay_ms)
+        if valid_samples == 0:
+            return self.last_valid_position
+        return (x_total / valid_samples, y_total / valid_samples)
+
+class PIDController:
+    def __init__(self, kp, ki, kd, setpoint=0, output_limits=(None, None)):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.setpoint = setpoint
+        self.output_limits = output_limits
+        self._last_error = 0
+        self._integral = 0
+    
+    def compute(self, measurement):
+        error = self.setpoint - measurement
+        self._integral += error
+        derivative = error - self._last_error
+        output = (self.kp * error) + (self.ki * self._integral) + (self.kd * derivative)
+        
+        # Apply output limits
+        min_output, max_output = self.output_limits
+        if min_output is not None:
+            output = max(min_output, output)
+        if max_output is not None:
+            output = min(max_output, output)
+        
+        self._last_error = error
+        return output
 
 # Intake class
 class Intake:
@@ -1031,6 +1329,22 @@ class AutonomousStep:
         self.matchloader_toggle_state = matchloader_toggle_state
 
 
+class StepAutonomousRoutine:
+    """Container for step-based autonomous sequences."""
+    def __init__(self, name="Steps", steps=None):
+        self.name = name
+        self.steps = list(steps) if steps is not None else []
+
+    def add_step(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state=None):
+        self.steps.append(
+            AutonomousStep(left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state)
+        )
+        return self
+
+    def clear(self):
+        self.steps = []
+
+
 class AutonomousController:
     def __init__(self, drivecontroller, intake, outtake, matchloader, brain, logger, descore=None):
         self.drivecontroller = drivecontroller
@@ -1038,7 +1352,8 @@ class AutonomousController:
         self.outtake = outtake
         self.brain = brain
         self.logger = logger
-        self.steps = []
+        self.step_routine = StepAutonomousRoutine("Steps")
+        self.steps = self.step_routine.steps
         self.timer = Timer()
         self.currentstepidx = 0
         self.completesteptime = 0
@@ -1050,9 +1365,23 @@ class AutonomousController:
         self.playback_idx = 0
         self.playback_timer = Timer()
         self.frame_duration = 0.01  # 10ms per frame (100 FPS recording)
+        self.playback_left_origin_deg = 0
+        self.playback_right_origin_deg = 0
+        self.position_kp = 0.04
+        self.max_position_correction = 35
+
+        """TODO: Add GPS Sensor PID control"""
 
     def add_step(self, step):
-        self.steps.append(step)
+        self.step_routine.steps.append(step)
+
+    def set_step_routine(self, routine):
+        """Set the active step-based autonomous routine."""
+        self.step_routine = routine
+        self.steps = self.step_routine.steps
+
+    def use_steps_mode(self):
+        self.mode = "steps"
     
     def set_frames(self, frames):
         """Set playback frames directly (from binary file)."""
@@ -1062,12 +1391,24 @@ class AutonomousController:
     def set_mode(self, mode):
         """Set autonomous mode: 'steps' or 'movestring'."""
         self.mode = mode
+
+    def _stop_all_outputs(self):
+        self.drivecontroller.update_manually(0, 0)
+        self.intake.update_manually(0)
+        self.outtake.update_manually(0)
+        self.matchloader.update_manually(0)
+
+    def is_finished(self):
+        if self.mode == "movestring":
+            return self.playback_idx >= len(self.playback_frames)
+        return self.currentstepidx >= len(self.steps)
     
     def start(self):
         self.timer.reset()
         self.currentstepidx = 0
         self.playback_idx = 0
         self.playback_timer.reset()
+        self.playback_left_origin_deg, self.playback_right_origin_deg = self.drivecontroller.get_drive_positions_degrees()
         if self.mode == "steps" and self.steps:
             self.completesteptime = self.steps[0].duration
         else:
@@ -1083,17 +1424,37 @@ class AutonomousController:
         """Playback recorded frames - one frame per update call for 1:1 timing."""
         if self.playback_idx >= len(self.playback_frames):
             # Finished playback
-            self.drivecontroller.update_manually(0, 0)
-            self.intake.update_manually(0)
-            self.outtake.update_manually(0)
-            self.matchloader.update_manually(0)
+            self._stop_all_outputs()
             return
         
         # Get current frame and apply it
         frame = self.playback_frames[self.playback_idx]
-        left, right, intake_spd, outtake_spd, matchloader_spd, pneumatic_state = frame
-        
-        self.drivecontroller.update_manually(left, right)
+        left = frame[0]
+        right = frame[1]
+        intake_spd = frame[2]
+        outtake_spd = frame[3]
+        matchloader_spd = frame[4]
+        pneumatic_state = frame[5]
+
+        adjusted_left = left
+        adjusted_right = right
+        if len(frame) >= 8:
+            recorded_left_pos_deg = frame[6]
+            recorded_right_pos_deg = frame[7]
+            target_left_pos_deg = self.playback_left_origin_deg + recorded_left_pos_deg
+            target_right_pos_deg = self.playback_right_origin_deg + recorded_right_pos_deg
+            current_left_pos_deg, current_right_pos_deg = self.drivecontroller.get_drive_positions_degrees()
+
+            left_error = target_left_pos_deg - current_left_pos_deg
+            right_error = target_right_pos_deg - current_right_pos_deg
+
+            left_correction = max(-self.max_position_correction, min(self.max_position_correction, left_error * self.position_kp))
+            right_correction = max(-self.max_position_correction, min(self.max_position_correction, right_error * self.position_kp))
+
+            adjusted_left = left + left_correction
+            adjusted_right = right + right_correction
+
+        self.drivecontroller.update_manually(adjusted_left, adjusted_right)
         self.intake.update_manually(intake_spd)
         self.outtake.update_manually(outtake_spd)
         self.matchloader.update_manually(matchloader_spd)
@@ -1106,13 +1467,10 @@ class AutonomousController:
         self.playback_idx += 1
     
     def _update_steps(self):
-        """Original step-based autonomous."""
+        """Run the active step-based autonomous routine."""
         if self.currentstepidx >= len(self.steps):
             # finished
-            self.drivecontroller.update_manually(0, 0)
-            self.intake.update_manually(0)
-            self.outtake.update_manually(0)
-            self.matchloader.update_manually(0)
+            self._stop_all_outputs()
             return
 
         # VEX Timer.time defaults to milliseconds, so ask for seconds to match
@@ -1123,10 +1481,7 @@ class AutonomousController:
 
             if self.currentstepidx >= len(self.steps):
                 # finished
-                self.drivecontroller.update_manually(0, 0)
-                self.intake.update_manually(0)
-                self.outtake.update_manually(0)
-                self.matchloader.update_manually(0)
+                self._stop_all_outputs()
                 return
 
         step = self.steps[self.currentstepidx]
@@ -1214,6 +1569,7 @@ descore = ButtonControlledPneumatic(controller.buttonUp, DigitalOut(brain.three_
 intake = Intake(controller, Motor(Ports.PORT9))
 outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
 matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.three_wire_port.b))
+heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
 drivetrain = DriveController(
     [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
@@ -1222,15 +1578,19 @@ drivetrain = DriveController(
 )
 
 auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger, descore)
-# autonomous steps. Format: left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
-auton.add_step(AutonomousStep(-30, -30, 100, 50, 0, 2, matchloader_toggle_state="b"))
-auton.add_step(AutonomousStep(0, 0, 100, 50, 0, 5, matchloader_toggle_state="b"))
+# Built-in step autonomous (slot 5). Format:
+# left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
+slot5_steps = StepAutonomousRoutine("Steps Slot 5")
+slot5_steps.add_step(-30, -30, 100, 50, 0, 2, matchloader_toggle_state="b")
+slot5_steps.add_step(0, 0, 100, 50, 0, 5, matchloader_toggle_state="b")
+auton.set_step_routine(slot5_steps)
 
 # Autonomous manager for SD card save/load
 auton_manager = AutonomousManager(brain, logger, auton)
 
 # Config button (right arrow)
 config_button = WrappedButton(controller.buttonRight)
+flipfront_button = WrappedButton(controller.buttonA)
 
 # To use a recorded MoveString instead of steps, uncomment and paste your MoveString:
 # auton.set_movestring("MS1:your_movestring_here")
@@ -1313,11 +1673,20 @@ def show_config_ui():
     start_y = 180
     spacing = 5
     
-    # Create slot buttons 1-4 for selection
-    for i in range(1, 5):
+    # Create slot buttons 1-5 for selection (slot 5 = built-in steps)
+    for i in range(1, 6):
+        is_steps_slot = i == auton_manager.STEPS_SLOT
         has_data = auton_manager.slot_has_data(i)
         is_selected = auton_manager.selected_slot == i
-        if is_selected:
+
+        if is_steps_slot:
+            if is_selected:
+                color = Color.CYAN
+                label = "[Steps]"
+            else:
+                color = Color.BLUE
+                label = "Steps"
+        elif is_selected:
             color = Color.CYAN
             label = "[" + str(i) + "]"
         elif has_data:
@@ -1423,6 +1792,7 @@ while True:
         ui.draw()
         record_button.update_state()
         config_button.update_state()
+        flipfront_button.update_state()
         
         if config_button.pressed() and not auton_manager.save_mode:
             if auton_manager.config_mode:
@@ -1442,6 +1812,10 @@ while True:
                 move_recorder.start_recording()
                 frame_timer.reset()
                 logger.log("Recording started! Press left arrow to stop.")
+
+        if flipfront_button.pressed() and not auton_manager.config_mode and not auton_manager.save_mode:
+            flipped = drivetrain.toggle_front()
+            logger.log("Front flipped" if flipped else "Front normal")
     
     # Check if a consistent frame tick has elapsed for recording/playback
     frame_tick = frame_timer.time(vex.TimeUnits.SECONDS) >= FRAME_INTERVAL
@@ -1457,7 +1831,7 @@ while True:
             if frame_tick:
                 auton.update()
             drivetrain.update_motor_speeds()
-            if auton.mode == "movestring" and auton.playback_idx >= len(auton.playback_frames):
+            if auton.is_finished():
                 auton_manager.stop_playback()
                 logger.log("Playback complete")
         else:
@@ -1467,34 +1841,43 @@ while True:
             outtake.update_from_controller()
             matchloader.update_from_controller()
             descore.update_from_controller()
+            heightadjuster.update_from_controller()
             
             if move_recorder.recording and frame_tick:
-                if controller.buttonR1.pressing():
-                    current_intake = intake.speed
-                elif controller.buttonR2.pressing():
-                    current_intake = -intake.speed
-                else:
-                    current_intake = 0
-                
-                if controller.buttonL1.pressing():
-                    current_outtake = outtake.speed
-                elif controller.buttonL2.pressing():
-                    current_outtake = -outtake.speed
-                else:
-                    current_outtake = 0
-                
-                current_matchloader = 100 if matchloader.toggle_state.state == "a" else 0
-                
-                current_pneumatic = descore.toggle_state.state == "a"
-                
-                move_recorder.record_frame(
-                    drivetrain.left_speed,
-                    drivetrain.right_speed,
-                    current_intake,
-                    current_outtake,
-                    current_matchloader,
-                    current_pneumatic
-                )
+                try:
+                    left_pos_deg, right_pos_deg = drivetrain.get_drive_positions_degrees()
+
+                    if controller.buttonR1.pressing():
+                        current_intake = intake.speed
+                    elif controller.buttonR2.pressing():
+                        current_intake = -intake.speed
+                    else:
+                        current_intake = 0
+                    
+                    if controller.buttonL1.pressing():
+                        current_outtake = outtake.speed
+                    elif controller.buttonL2.pressing():
+                        current_outtake = -outtake.speed
+                    else:
+                        current_outtake = 0
+                    
+                    current_matchloader = 100 if matchloader.toggle_state.state == "a" else 0
+                    
+                    current_pneumatic = descore.toggle_state.state == "a"
+                    
+                    move_recorder.record_frame(
+                        drivetrain.left_speed,
+                        drivetrain.right_speed,
+                        current_intake,
+                        current_outtake,
+                        current_matchloader,
+                        current_pneumatic,
+                        left_pos_deg,
+                        right_pos_deg
+                    )
+                except Exception as e:
+                    logger.error("Recording error: " + str(e))
+                    move_recorder.stop_recording()
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
