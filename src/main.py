@@ -788,9 +788,9 @@ class DriveController():
     def get_velocity_real(self):
         """Estimate current velocity in m/s and z rotation of robot in deg/s based on motor speeds, should be pretty accurate, but will drift over time"""
         wheel_diameter_mm = 83
-        drivetrain_width_mm = 300 # wrong, will adjust, just prototype of code
+        drivetrain_width_mm = 315
         wheel_circumference_mm = wheel_diameter_mm * math.pi
-        gearratio = 48/36 #speed at motor * gearratio = speed at wheel
+        gearratio = 60/36 #speed at motor * gearratio = speed at wheel
         left_speed_dps, right_speed_dps = self.get_motor_speeds()
         left_speed_mps = (left_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
         right_speed_mps = (right_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
@@ -863,6 +863,16 @@ class KalmanFilter:
         except Exception:
             return None
 
+    def _try_get_accurate_gps(self):
+        if self.gps is None:
+            return None
+        try:
+            if hasattr(self.gps, "get_accurate_reading"):
+                return self.gps.get_accurate_reading()
+        except Exception:
+            return None
+        return None
+
     def _try_get_gps_quality(self):
         if self.gps is None:
             return None
@@ -875,7 +885,10 @@ class KalmanFilter:
         if self._initialized:
             return
 
-        gps_pos = self._try_get_gps()
+        # Prefer an averaged GPS reading for the initial estimate.
+        gps_pos = self._try_get_accurate_gps()
+        if gps_pos is None:
+            gps_pos = self._try_get_gps()
         if gps_pos is not None:
             self.current_estimate = Vector3D(gps_pos[0], gps_pos[1], gps_pos[2])
 
@@ -1076,13 +1089,10 @@ class GPSSensor:
         except Exception:
             return self.last_valid_quality
 
-    def set_reference_point(self, x, y, heading=0.0, distance_units=vex.DistanceUnits.MM, heading_units=vex.RotationUnits.DEG):
-        """Set the GPS reference point on the field (x, y, heading)."""
+    def set_origin(self, x, y, distance_units=vex.DistanceUnits.MM):
+        """Set the GPS sensor reference point offset on the robot."""
         try:
-            self.sensor.set_location(x, y, distance_units, heading, heading_units)
-            normalized_heading = self._normalize_heading(heading)
-            self.last_valid_position = (x, y, normalized_heading)
-            self.last_valid_heading = normalized_heading
+            self.sensor.set_origin(x, y, distance_units)
             return True
         except Exception:
             return False
@@ -1409,6 +1419,12 @@ def usercontrol_start():
     logger.log("User control started.")
         
 
+"""
+===========================================================
+----------------------Configuration------------------------
+===========================================================
+"""
+
 # Brain should be defined by default
 brain=Brain()
 controller = Controller()
@@ -1423,6 +1439,7 @@ matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.
 heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
 GPS = GPSSensor(Gps(Ports.PORT11))
+GPS.set_origin(105, 128)
 drivetrain = DriveController(
     [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
     [Motor(Ports.PORT1), Motor(Ports.PORT2), Motor(Ports.PORT3)],
