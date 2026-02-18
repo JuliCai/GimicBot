@@ -841,7 +841,11 @@ class KalmanFilter:
         # Robot geometry for odometry model.
         self._wheel_diameter_mm = 83.0
         self._track_width_mm = 300.0
-        self._gear_ratio = 48.0 / 36.0
+        # wheel speed = motor speed * (driven/driving)
+        # Keep this consistent with DriveController.get_velocity_real().
+        # Previous value (48/36) over-scaled odometry distance and caused
+        # small forward overshoot before GPS correction settled.
+        self._gear_ratio = 36.0 / 60.0
 
         self._timer = Timer()
         self._timer.reset()
