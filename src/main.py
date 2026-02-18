@@ -1140,7 +1140,7 @@ class DriveController():
 
     
     def get_velocity_real(self):
-        """Estimate current velocity in m/s and z rotation of robot in deg/s based on motor speeds."""
+        """Estimate current velocity in m/s and z rotation of robot in deg/s based on motor speeds, should be pretty accurate, but will drift over time"""
         wheel_diameter_mm = 83
         drivetrain_width_mm = 300 # wrong, will adjust, just prototype of code
         wheel_circumference_mm = wheel_diameter_mm * math.pi
@@ -1157,10 +1157,11 @@ class DriveController():
 class KalmanFilter:
     def __init__(self):
         pass
+    def update(self):
+        pass
     """¯\_(ツ)_/¯ idk how"""
 
 
-"""TODO: GPS class"""
 class GPSSensor:
     def __init__(self, sensor):
         self.sensor = sensor
@@ -1198,6 +1199,7 @@ class GPSSensor:
         return (x_total / valid_samples, y_total / valid_samples)
 
 class PIDController:
+    """general purpose PID controller, always useful"""
     def __init__(self, kp, ki, kd, setpoint=0, output_limits=(None, None)):
         self.kp = kp
         self.ki = ki
@@ -1580,6 +1582,8 @@ outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(
 matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.three_wire_port.b))
 heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
+GPS = GPSSensor(Gps(Ports.PORT11))
+Filter = KalmanFilter()
 drivetrain = DriveController(
     [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
     [Motor(Ports.PORT1), Motor(Ports.PORT2), Motor(Ports.PORT3)],
@@ -1794,6 +1798,11 @@ last_outtake_speed = 0
 last_matchloader_speed = 0
 last_pneumatic_state = False
 
+"""
+=====================================================================
+---------------------- Main control loop ----------------------------
+=====================================================================
+"""
 while True:
     if screenupdatetimer.time() > 1/target_framerate:
         screenupdatetimer.reset()
