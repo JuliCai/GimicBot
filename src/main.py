@@ -799,27 +799,265 @@ class DriveController():
         return forward_speed, rotation_z_speed
 
 
-"""TODO: KalmanFilter class, uses GPS and Drivetrain odometry to produce a more accurate position estimate"""
+"""TODO: KalmanFilter class, uses GPS, gyro, and Drivetrain odometry to produce a more accurate position estimate"""
 class KalmanFilter:
-    def __init__(self):
-        pass
+    """Simple pose filter for x/y/heading using odometry prediction + GPS correction.
+
+    State is treated as three mostly-independent 1D filters:
+    - x (mm)
+    - y (mm)
+    - heading (deg)
+
+    Prediction comes from wheel odometry, correction comes from GPS.
+    """
+    def __init__(self, gps_sensor=None, drivetrain_controller=None):
+        self.gps = gps_sensor
+        self.drivetrain = drivetrain_controller
+
+        # x (mm), y (mm), heading (deg)
+        self.current_estimate = Vector3D()
+        # forward speed (m/s), lateral speed (m/s), yaw rate (deg/s)
+        self.current_velocity = Vector3D()
+
+        self._initialized = False
+        self._last_left_deg = None
+        self._last_right_deg = None
+
+        # Independent covariance terms for x, y, heading.
+        # Start large so first GPS readings are trusted.
+        self._p_x = 10000.0
+        self._p_y = 10000.0
+        self._p_h = 400.0
+
+        # Tunable process noise (higher = trust odometry less).
+        self._q_pos_per_sec = 20.0
+        self._q_heading_per_sec = 5.0
+
+        # Tunable GPS measurement noise (lower = trust GPS more).
+        self._r_x = 2500.0
+        self._r_y = 2500.0
+        self._r_h = 25.0
+
+        # Robot geometry for odometry model.
+        self._wheel_diameter_mm = 83.0
+        self._track_width_mm = 300.0
+        self._gear_ratio = 48.0 / 36.0
+
+        self._timer = Timer()
+        self._timer.reset()
+        self._last_time_s = self._timer.time(vex.TimeUnits.SECONDS)
+
+    def _wrap_heading(self, heading_deg):
+        return heading_deg % 360
+
+    def _angle_residual(self, measurement_deg, estimate_deg):
+        """Return shortest signed angle delta in degrees (measurement - estimate)."""
+        delta = (measurement_deg - estimate_deg + 180.0) % 360.0 - 180.0
+        return delta
+
+    def _try_get_gps(self):
+        if self.gps is None:
+            return None
+        try:
+            return self.gps.get_position()
+        except Exception:
+            return None
+
+    def _try_get_gps_quality(self):
+        if self.gps is None:
+            return None
+        try:
+            return self.gps.get_quality()
+        except Exception:
+            return None
+
+    def _initialize_if_needed(self):
+        if self._initialized:
+            return
+
+        gps_pos = self._try_get_gps()
+        if gps_pos is not None:
+            self.current_estimate = Vector3D(gps_pos[0], gps_pos[1], gps_pos[2])
+
+        if self.drivetrain is not None:
+            try:
+                left_deg, right_deg = self.drivetrain.get_drive_positions_degrees()
+                self._last_left_deg = left_deg
+                self._last_right_deg = right_deg
+            except Exception:
+                self._last_left_deg = 0.0
+                self._last_right_deg = 0.0
+        else:
+            self._last_left_deg = 0.0
+            self._last_right_deg = 0.0
+
+        self._initialized = True
+
+    def _predict_from_odometry(self, dt_s):
+        if self.drivetrain is None:
+            return
+
+        try:
+            left_deg, right_deg = self.drivetrain.get_drive_positions_degrees()
+        except Exception:
+            return
+
+        if self._last_left_deg is None or self._last_right_deg is None:
+            self._last_left_deg = left_deg
+            self._last_right_deg = right_deg
+            return
+
+        d_left_deg = left_deg - self._last_left_deg
+        d_right_deg = right_deg - self._last_right_deg
+        self._last_left_deg = left_deg
+        self._last_right_deg = right_deg
+
+        wheel_circumference_mm = self._wheel_diameter_mm * math.pi
+        d_left_mm = (d_left_deg / 360.0) * wheel_circumference_mm * self._gear_ratio
+        d_right_mm = (d_right_deg / 360.0) * wheel_circumference_mm * self._gear_ratio
+
+        d_center_mm = (d_left_mm + d_right_mm) / 2.0
+        d_heading_deg = ((d_right_mm - d_left_mm) / self._track_width_mm) * (180.0 / math.pi)
+
+        predicted_heading = self._wrap_heading(self.current_estimate.z + d_heading_deg)
+        heading_rad = math.radians(predicted_heading)
+
+        self.current_estimate.x += d_center_mm * math.cos(heading_rad)
+        self.current_estimate.y += d_center_mm * math.sin(heading_rad)
+        self.current_estimate.z = predicted_heading
+
+        # Covariance growth during prediction.
+        motion_scale = abs(d_center_mm) / 10.0
+        turn_scale = abs(d_heading_deg) / 5.0
+        self._p_x += self._q_pos_per_sec * dt_s + motion_scale
+        self._p_y += self._q_pos_per_sec * dt_s + motion_scale
+        self._p_h += self._q_heading_per_sec * dt_s + turn_scale
+
+    def _correct_with_gps(self):
+        gps_pos = self._try_get_gps()
+        if gps_pos is None:
+            return
+
+        gps_x, gps_y, gps_h = gps_pos
+        quality = self._try_get_gps_quality()
+
+        # VEX GPS quality guidance:
+        # - 100: full valid position + heading
+        # - ~90: position can degrade (fallback behavior)
+        # - 0-80: only heading is considered valid, position is unreliable
+        # Use quality to dynamically scale measurement noise.
+        position_valid = True
+        heading_valid = True
+        r_x = self._r_x
+        r_y = self._r_y
+        r_h = self._r_h
+
+        if quality is not None:
+            if quality <= 0:
+                position_valid = False
+                heading_valid = False
+            elif quality < 80:
+                position_valid = False
+                # Heading exists but becomes less trustworthy as quality drops.
+                # Scale heading noise up as quality decreases.
+                q_scale = max(1.0, (100.0 - quality) / 20.0)
+                r_h = self._r_h * q_scale
+            elif quality < 90:
+                # Keep heading correction; heavily de-weight position correction.
+                r_x = self._r_x * 4.0
+                r_y = self._r_y * 4.0
+                r_h = self._r_h * 1.5
+            elif quality < 95:
+                # Mildly de-weight GPS correction near the degradation band.
+                r_x = self._r_x * 2.0
+                r_y = self._r_y * 2.0
+                r_h = self._r_h * 1.2
+
+        if position_valid:
+            # x update
+            kx = self._p_x / (self._p_x + r_x)
+            self.current_estimate.x = self.current_estimate.x + kx * (gps_x - self.current_estimate.x)
+            self._p_x = (1.0 - kx) * self._p_x
+
+            # y update
+            ky = self._p_y / (self._p_y + r_y)
+            self.current_estimate.y = self.current_estimate.y + ky * (gps_y - self.current_estimate.y)
+            self._p_y = (1.0 - ky) * self._p_y
+
+        if heading_valid:
+            # heading update with wrapped innovation
+            kh = self._p_h / (self._p_h + r_h)
+            h_residual = self._angle_residual(gps_h, self.current_estimate.z)
+            self.current_estimate.z = self._wrap_heading(self.current_estimate.z + kh * h_residual)
+            self._p_h = (1.0 - kh) * self._p_h
+
+    def _update_velocity_estimate(self):
+        if self.drivetrain is None:
+            return
+        try:
+            v_forward_mps, v_yaw_dps = self.drivetrain.get_velocity_real()
+            self.current_velocity = Vector3D(v_forward_mps, 0.0, v_yaw_dps)
+        except Exception:
+            # Keep last known velocity.
+            pass
+
     def update(self):
-        pass
-    """¯\\_(ツ)_/¯ idk how"""
+        self._initialize_if_needed()
+
+        now_s = self._timer.time(vex.TimeUnits.SECONDS)
+        dt_s = now_s - self._last_time_s
+        self._last_time_s = now_s
+        if dt_s <= 0:
+            dt_s = 0.01
+
+        self._predict_from_odometry(dt_s)
+        self._correct_with_gps()
+        self._update_velocity_estimate()
+
+    def get_estimate(self):
+        return self.current_estimate
+
+    def get_velocity(self):
+        return self.current_velocity
 
 
 class GPSSensor:
     def __init__(self, sensor):
         self.sensor = sensor
-        self.last_valid_position = (0, 0)
+        self.last_valid_position = (0.0, 0.0, 0.0)
+        self.last_valid_heading = 0.0
         self.last_valid_gyro_z = 0
+        self.last_valid_quality = 0
+
+    def _normalize_heading(self, heading):
+        return heading % 360
+
+    def _average_heading(self, sin_total, cos_total):
+        if sin_total == 0 and cos_total == 0:
+            return self.last_valid_heading
+        avg_heading = math.degrees(math.atan2(sin_total, cos_total))
+        return self._normalize_heading(avg_heading)
+
     def get_position(self):
         try:
-            position = self.sensor.position()
+            x = self.sensor.x_position(vex.DistanceUnits.MM)
+            y = self.sensor.y_position(vex.DistanceUnits.MM)
+            heading = self._normalize_heading(self.sensor.heading())
+            position = (x, y, heading)
             self.last_valid_position = position
+            self.last_valid_heading = heading
             return position
         except Exception:
             return None
+
+    def get_heading(self):
+        try:
+            heading = self._normalize_heading(self.sensor.heading())
+            self.last_valid_heading = heading
+            return heading
+        except Exception:
+            return self.last_valid_heading
+
     def get_internal_gyro_z(self):
         """get internal stuff with gps_sensor.orientation(axis, units)"""
         try:
@@ -828,21 +1066,52 @@ class GPSSensor:
             return orientation
         except Exception:
             return self.last_valid_gyro_z
+
+    def get_quality(self):
+        """Get current GPS signal quality percentage (0-100)."""
+        try:
+            quality = self.sensor.quality()
+            self.last_valid_quality = quality
+            return quality
+        except Exception:
+            return self.last_valid_quality
+
+    def set_reference_point(self, x, y, heading=0.0, distance_units=vex.DistanceUnits.MM, heading_units=vex.RotationUnits.DEG):
+        """Set the GPS reference point on the field (x, y, heading)."""
+        try:
+            self.sensor.set_location(x, y, distance_units, heading, heading_units)
+            normalized_heading = self._normalize_heading(heading)
+            self.last_valid_position = (x, y, normalized_heading)
+            self.last_valid_heading = normalized_heading
+            return True
+        except Exception:
+            return False
+
     def get_accurate_reading(self, samples=5, delay_ms=100):
-        """Get an averaged GPS reading to reduce noise."""
+        """Get an averaged GPS reading (x, y, heading) to reduce noise; best while stationary."""
         x_total = 0
         y_total = 0
+        heading_sin_total = 0
+        heading_cos_total = 0
         valid_samples = 0
         for _ in range(samples):
             pos = self.get_position()
             if pos is not None:
-                x_total += pos.x
-                y_total += pos.y
+                x, y, heading = pos
+                x_total += x
+                y_total += y
+                heading_radians = math.radians(heading)
+                heading_sin_total += math.sin(heading_radians)
+                heading_cos_total += math.cos(heading_radians)
                 valid_samples += 1
             vex.sleep(delay_ms)
         if valid_samples == 0:
             return self.last_valid_position
-        return (x_total / valid_samples, y_total / valid_samples)
+        avg_heading = self._average_heading(heading_sin_total, heading_cos_total)
+        averaged = (x_total / valid_samples, y_total / valid_samples, avg_heading)
+        self.last_valid_position = averaged
+        self.last_valid_heading = avg_heading
+        return averaged
 
 class PIDController:
     """general purpose PID controller, always useful"""
@@ -1154,12 +1423,12 @@ matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.
 heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
 GPS = GPSSensor(Gps(Ports.PORT11))
-Filter = KalmanFilter()
 drivetrain = DriveController(
     [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
     [Motor(Ports.PORT1), Motor(Ports.PORT2), Motor(Ports.PORT3)],
     controller,
 )
+Filter = KalmanFilter(GPS, drivetrain)
 
 auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger, descore)
 # Five autonomous step slots. Format:
@@ -1350,6 +1619,7 @@ while True:
             matchloader.update_from_controller()
             descore.update_from_controller()
             heightadjuster.update_from_controller()
+        Filter.update() # update position estimate
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
