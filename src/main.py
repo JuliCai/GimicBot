@@ -325,461 +325,107 @@ class Vector3D():
         return projected
     
 
-# Recording class - writes directly to SD card in binary format
-class MoveRecorder:
-    """Records controller inputs directly to SD card for playback.
-    
-    Binary format (MR4): 4-byte header "MR4:" + 14 bytes per frame
-    Each frame: left, right, intake, outtake, matchloader, pneumatic, left_pos_deg, right_pos_deg
-    Control values are unsigned bytes with +128 offset (so -100 = 28, 0 = 128, 100 = 228)
-    Positions are signed 32-bit integers in degrees (relative to recording start)
-    """
-    
-    TEMP_FILE = "recording_temp.bin"
-    
-    def __init__(self, brain):
-        self.brain = brain
-        self.recording = False
-        self.frame_count = 0
-        self.frame_buffer = bytearray()  # Small buffer to batch writes
-        self.frame_size = 14
-        self.buffer_size = self.frame_size * 10  # Write every 10 frames
-        self.left_origin_deg = None
-        self.right_origin_deg = None
-    
-    def start_recording(self):
-        """Start recording - creates temp file with header."""
-        self.recording = True
-        self.frame_count = 0
-        self.frame_buffer = bytearray()
-        self.left_origin_deg = None
-        self.right_origin_deg = None
-        # Write header to temp file
-        self.brain.sdcard.savefile(self.TEMP_FILE, bytearray("MR4:", "utf-8"))
-    
-    def stop_recording(self):
-        """Stop recording - flush remaining buffer."""
-        self.recording = False
-        # Flush any remaining frames in buffer
-        if len(self.frame_buffer) > 0:
-            self.brain.sdcard.appendfile(self.TEMP_FILE, self.frame_buffer)
-            self.frame_buffer = bytearray()
-        return self.frame_count
-    
-    def record_frame(self, left, right, intake_speed, outtake_speed, matchloader_speed, pneumatic_state, left_pos_deg=None, right_pos_deg=None):
-        """Record a single frame - buffers and writes to SD periodically."""
-        if not self.recording:
-            return
-        
-        # Convert signed values (-100 to 100) to unsigned bytes (28 to 228) with offset 128
-        def to_byte(val):
-            clamped = max(-128, min(127, int(round(val))))
-            return (clamped + 128) & 0xFF
-
-        def to_int_compat(val):
-            """Convert VEX numeric-ish values to plain Python int safely."""
-            try:
-                return int(val)
-            except Exception:
-                try:
-                    return int(float(val))
-                except Exception:
-                    return 0
-
-        def append_i32(buffer, val):
-            # Avoid int.to_bytes for better compatibility with VEX Python runtime.
-            as_int = to_int_compat(val)
-            if as_int > 2147483647:
-                as_int = 2147483647
-            if as_int < -2147483648:
-                as_int = -2147483648
-            if as_int < 0:
-                as_int = (1 << 32) + as_int
-            bytes4 = bytearray(4)
-            bytes4[0] = as_int & 0xFF
-            bytes4[1] = (as_int >> 8) & 0xFF
-            bytes4[2] = (as_int >> 16) & 0xFF
-            bytes4[3] = (as_int >> 24) & 0xFF
-            buffer.extend(bytes4)
-
-        if left_pos_deg is not None:
-            left_pos_deg = to_int_compat(left_pos_deg)
-        if right_pos_deg is not None:
-            right_pos_deg = to_int_compat(right_pos_deg)
-
-        if left_pos_deg is not None and self.left_origin_deg is None:
-            self.left_origin_deg = left_pos_deg
-        if right_pos_deg is not None and self.right_origin_deg is None:
-            self.right_origin_deg = right_pos_deg
-
-        left_pos_rel = 0
-        right_pos_rel = 0
-        if left_pos_deg is not None and self.left_origin_deg is not None:
-            left_pos_rel = left_pos_deg - self.left_origin_deg
-        if right_pos_deg is not None and self.right_origin_deg is not None:
-            right_pos_rel = right_pos_deg - self.right_origin_deg
-        
-        # Add frame to buffer (14 bytes)
-        self.frame_buffer.append(to_byte(left))
-        self.frame_buffer.append(to_byte(right))
-        self.frame_buffer.append(to_byte(intake_speed))
-        self.frame_buffer.append(to_byte(outtake_speed))
-        self.frame_buffer.append(to_byte(matchloader_speed))
-        self.frame_buffer.append(1 if pneumatic_state else 0)
-        append_i32(self.frame_buffer, left_pos_rel)
-        append_i32(self.frame_buffer, right_pos_rel)
-        
-        self.frame_count += 1
-        
-        # Write buffer to SD when full
-        if len(self.frame_buffer) >= self.buffer_size:
-            self.brain.sdcard.appendfile(self.TEMP_FILE, self.frame_buffer)
-            self.frame_buffer = bytearray()
-    
-    def get_temp_file(self):
-        """Get the temp file path for saving to a slot."""
-        return self.TEMP_FILE
-    
-    @staticmethod
-    def load_frames(brain, filepath):
-        """Load frames from a binary recording file."""
-        if not brain.sdcard.exists(filepath):
-            return []
-        
-        data = brain.sdcard.loadfile(filepath)
-        if not data:
-            return []
-        
-        # Check header
-        if len(data) < 4:
-            return []
-        
-        header = data[0:4]
-        try:
-            header_str = bytes(header).decode("utf-8")
-        except:
-            header_str = ""
-        
-        if header_str == "MR3:":
-            return MoveRecorder._parse_mr3(data)
-        elif header_str == "MR4:":
-            return MoveRecorder._parse_mr4(data)
-        elif header_str == "MR2:":
-            # Legacy text format
-            try:
-                return MoveRecorder._parse_mr2(bytes(data).decode("utf-8"))
-            except:
-                return []
-        elif header_str == "MS1:":
-            # Legacy compressed format
-            try:
-                return MoveRecorder._parse_ms1(bytes(data).decode("utf-8"))
-            except:
-                return []
-        
-        return []
-    
-    @staticmethod
-    def _parse_mr3(data):
-        """Parse MR3 binary format."""
-        frames = []
-        # Skip 4-byte header, read 6 bytes per frame
-        idx = 4
-        while idx + 6 <= len(data):
-            # Convert unsigned bytes back to signed values
-            def from_byte(b):
-                return b - 128
-            
-            frame = (
-                from_byte(data[idx]),
-                from_byte(data[idx + 1]),
-                from_byte(data[idx + 2]),
-                from_byte(data[idx + 3]),
-                from_byte(data[idx + 4]),
-                data[idx + 5]  # pneumatic is 0/1, no offset
-            )
-            frames.append(frame)
-            idx += 6
-        
-        return frames
-
-    @staticmethod
-    def _parse_mr4(data):
-        """Parse MR4 binary format with drivetrain position data."""
-        frames = []
-        idx = 4
-
-        def from_byte(b):
-            return b - 128
-
-        def from_i32(buf, start):
-            raw = (
-                buf[start]
-                | (buf[start + 1] << 8)
-                | (buf[start + 2] << 16)
-                | (buf[start + 3] << 24)
-            )
-            if raw >= (1 << 31):
-                raw -= (1 << 32)
-            return raw
-
-        while idx + 14 <= len(data):
-            frame = (
-                from_byte(data[idx]),
-                from_byte(data[idx + 1]),
-                from_byte(data[idx + 2]),
-                from_byte(data[idx + 3]),
-                from_byte(data[idx + 4]),
-                data[idx + 5],  # pneumatic is 0/1, no offset
-                from_i32(data, idx + 6),
-                from_i32(data, idx + 10),
-            )
-            frames.append(frame)
-            idx += 14
-
-        return frames
-    
-    @staticmethod
-    def _parse_mr2(move_string):
-        """Parse MR2 (text) format for backwards compatibility."""
-        data = move_string[4:]  # Remove "MR2:" header
-        if not data:
-            return []
-        
-        frames = []
-        segments = data.split(";")
-        
-        for segment in segments:
-            if not segment:
-                continue
-            parts = segment.split(",")
-            if len(parts) == 6:
-                frame = (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5]))
-                frames.append(frame)
-        
-        return frames
-    
-    @staticmethod
-    def _parse_ms1(move_string):
-        """Parse MS1 (legacy compressed) format for backwards compatibility."""
-        data = move_string[4:]
-        if not data:
-            return []
-        
-        b62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        
-        def decode_num(s):
-            if not s:
-                return 0
-            sign = 1
-            if s[0] == '-':
-                sign = -1
-                s = s[1:]
-            result = 0
-            for c in s:
-                result = result * 62 + b62.index(c)
-            return sign * result
-        
-        def decode_frame(s):
-            parts = s.split(",")
-            return tuple(decode_num(p) for p in parts)
-        
-        frames = []
-        segments = data.split(";")
-        prev_frame = (0, 0, 0, 0, 0, 0)
-        first = True
-        
-        for segment in segments:
-            if not segment:
-                continue
-            if "*" in segment:
-                frame_part, count_part = segment.rsplit("*", 1)
-                count = decode_num(count_part)
-            else:
-                frame_part = segment
-                count = 1
-            delta = decode_frame(frame_part)
-            for _ in range(count):
-                if first:
-                    frame = delta
-                    first = False
-                else:
-                    frame = tuple(prev_frame[i] + delta[i] for i in range(6))
-                frames.append(frame)
-                prev_frame = frame
-        
-        return frames
-
-
-# Autonomous file manager for SD card save/load
+# Autonomous slot manager for step-based routines
 class AutonomousManager:
-    """Manages saving, loading, and selecting autonomous routines from SD card."""
-    RECORDING_SLOT_MIN = 1
-    RECORDING_SLOT_MAX = 4
-    STEPS_SLOT = 5
-    
-    def __init__(self, brain, logger, auton_controller):
+    """Manages selecting and testing one of five step-based autonomous slots."""
+    SLOT_MIN = 1
+    SLOT_MAX = 5
+
+    def __init__(self, brain, logger, auton_controller, slot_routines):
         self.brain = brain
         self.logger = logger
         self.auton = auton_controller
-        self.selected_slot = self.STEPS_SLOT  # Default to built-in steps routine
+        self.slot_routines = slot_routines
+        self.selected_slot = self.SLOT_MIN
         self.config_mode = False
-        self.save_mode = False  # True when showing save slot buttons
-        self.playback_mode = False  # True when playing back in config mode
+        self.playback_mode = False
         self._load_selected_slot()
         self._apply_selected_slot()
-    
-    def _get_auton_filepath(self, slot):
-        """Get the filepath for an autonomous slot."""
-        return "auton_" + str(slot) + ".bin"
-    
+
     def _get_selected_filepath(self):
         """Get the filepath for the selected slot config."""
         return "selected_auton.txt"
-    
+
     def _sd_available(self):
         """Check if SD card is inserted."""
         return self.brain.sdcard.is_inserted()
-    
+
+    def _normalize_slot(self, slot):
+        if slot < self.SLOT_MIN:
+            return self.SLOT_MIN
+        if slot > self.SLOT_MAX:
+            return self.SLOT_MAX
+        return slot
+
     def _load_selected_slot(self):
-        """Load the selected autonomous slot from SD card."""
+        """Load selected slot preference from SD card when available."""
         if not self._sd_available():
-            self.logger.warn("No SD card - using slot 5 (steps)")
+            self.logger.warn("No SD card - using slot " + str(self.selected_slot))
             return
         try:
             data = self.brain.sdcard.loadfile(self._get_selected_filepath())
             if data:
                 content = bytes(data).decode("utf-8").strip()
                 if content.isdigit():
-                    slot = int(content)
-                    if self.RECORDING_SLOT_MIN <= slot <= self.STEPS_SLOT:
-                        self.selected_slot = slot
-                        self.logger.log("Loaded auton slot: " + str(slot))
+                    loaded_slot = self._normalize_slot(int(content))
+                    self.selected_slot = loaded_slot
+                    self.logger.log("Loaded auton slot: " + str(loaded_slot))
         except:
-            self.logger.log("No saved auton selection, using slot 5")
-    
+            self.logger.log("No saved auton selection, using slot " + str(self.selected_slot))
+
     def _save_selected_slot(self, slot):
-        """Save the selected autonomous slot to SD card."""
-        self.selected_slot = slot
+        """Persist selected slot preference to SD card when available."""
+        self.selected_slot = self._normalize_slot(slot)
         if not self._sd_available():
-            self.logger.warn("No SD card - selection kept in memory")
             return
         try:
-            self.brain.sdcard.savefile(self._get_selected_filepath(), bytearray(str(slot), "utf-8"))
-            self.logger.log("Saved auton selection: slot " + str(slot))
+            self.brain.sdcard.savefile(self._get_selected_filepath(), bytearray(str(self.selected_slot), "utf-8"))
         except Exception as e:
             self.logger.error("Failed to save selection: " + str(e))
 
-    def _apply_steps_slot(self):
-        self.auton.use_steps_mode()
-        count = len(self.auton.steps)
-        self.logger.log("Selected slot 5 (steps, " + str(count) + " steps)")
-
     def _apply_selected_slot(self):
-        if self.selected_slot == self.STEPS_SLOT:
-            self._apply_steps_slot()
-            return True
-        loaded = self._load_auton_from_slot(self.selected_slot)
-        if loaded:
-            return True
+        routine = self.slot_routines.get(self.selected_slot)
+        if routine is None:
+            self.logger.warn("Missing step routine for slot " + str(self.selected_slot))
+            return False
+        self.auton.set_step_routine(routine)
+        self.auton.use_steps_mode()
+        self.logger.log(
+            "Selected slot "
+            + str(self.selected_slot)
+            + " ("
+            + str(len(routine.steps))
+            + " steps)"
+        )
+        return True
 
-        self.logger.warn("Slot " + str(self.selected_slot) + " is empty - using slot 5 (steps)")
-        self.selected_slot = self.STEPS_SLOT
-        self._apply_steps_slot()
-        return False
-    
-    def _load_auton_from_slot(self, slot):
-        """Load an autonomous routine from a slot file."""
-        if slot == self.STEPS_SLOT:
-            self._apply_steps_slot()
-            return True
-        if not self._sd_available():
-            self.logger.error("No SD card!")
-            return False
-        filepath = self._get_auton_filepath(slot)
-        if not self.brain.sdcard.exists(filepath):
-            return False
-        frames = MoveRecorder.load_frames(self.brain, filepath)
-        if frames:
-            self.auton.set_frames(frames)
-            self.auton.set_mode("movestring")
-            self.logger.log("Loaded slot " + str(slot) + " (" + str(len(frames)) + " frames)")
-            return True
-        return False
-    
-    def save_to_slot(self, slot, temp_file):
-        """Copy the temp recording file to a slot file."""
-        if not self._sd_available():
-            self.logger.error("No SD card!")
-            return False
-        if not self.brain.sdcard.exists(temp_file):
-            self.logger.error("No recording to save!")
-            return False
-        try:
-            # Load temp file and save to slot
-            data = self.brain.sdcard.loadfile(temp_file)
-            if data:
-                filepath = self._get_auton_filepath(slot)
-                result = self.brain.sdcard.savefile(filepath, data)
-                if result and result > 0:
-                    self.logger.log("Saved to slot " + str(slot))
-                    return True
-            self.logger.error("Save failed!")
-            return False
-        except Exception as e:
-            self.logger.error("Save failed: " + str(e))
-            return False
-    
     def slot_has_data(self, slot):
-        """Check if a slot has a saved autonomous."""
-        if slot == self.STEPS_SLOT:
-            return True
-        if not self._sd_available():
-            return False
-        filepath = self._get_auton_filepath(slot)
-        return self.brain.sdcard.exists(filepath)
-    
-    def start_save_mode(self):
-        """Enter save mode after recording."""
-        self.save_mode = True
-        self.logger.log("Choose slot 1-4 or Trash")
-    
-    def end_save_mode(self):
-        """Exit save mode."""
-        self.pending_movestring = None
-        self.save_mode = False
-    
+        """All 5 slots are step-based and always available."""
+        return self.SLOT_MIN <= slot <= self.SLOT_MAX and slot in self.slot_routines
+
     def start_config_mode(self):
         """Enter config mode for selecting/testing autonomous."""
         self.config_mode = True
         self.logger.log("Config mode: Select auton slot")
-    
+
     def end_config_mode(self):
         """Exit config mode."""
         self.config_mode = False
         self.playback_mode = False
-    
-    def start_playback(self, slot):
-        """Start playing back an autonomous for testing."""
-        if slot == self.STEPS_SLOT:
-            self.auton.use_steps_mode()
-            self.playback_mode = True
-            self.auton.start()
-            self.logger.log("Playing slot 5 (steps)...")
-            return
 
-        if self._load_auton_from_slot(slot):
-            self.playback_mode = True
-            self.auton.start()
-            self.logger.log("Playing slot " + str(slot) + "...")
-        else:
-            self.logger.warn("Cannot play empty slot")
-    
+    def start_playback(self, slot):
+        """Start playing back a step autonomous for testing."""
+        self.selected_slot = self._normalize_slot(slot)
+        self._apply_selected_slot()
+        self.playback_mode = True
+        self.auton.start()
+        self.logger.log("Playing slot " + str(self.selected_slot) + "...")
+
     def stop_playback(self):
         """Stop autonomous playback."""
         self.playback_mode = False
         self.logger.log("Playback stopped")
-    
+
     def select_slot(self, slot):
         """Select a slot as the active autonomous for competition."""
         self._save_selected_slot(slot)
@@ -1159,7 +805,7 @@ class KalmanFilter:
         pass
     def update(self):
         pass
-    """¯\_(ツ)_/¯ idk how"""
+    """¯\\_(ツ)_/¯ idk how"""
 
 
 class GPSSensor:
@@ -1322,7 +968,7 @@ class ButtonControlledPneumatic:
             else:
                 self.digital_out.set(False)  # retract
     def update_manually(self, value):
-        """Set pneumatic state from a value (for autonomous/recording playback).
+        """Set pneumatic state from a value (for autonomous playback).
         Positive values = extend (state a), zero or negative = retract (state b)."""
         new_state = "a" if value > 0 else "b"
         if self.toggle_state.set_state(new_state):
@@ -1370,16 +1016,6 @@ class AutonomousController:
         self.completesteptime = 0
         self.matchloader = matchloader
         self.descore = descore
-        # Playback mode: "steps" for step-based, "movestring" for recorded playback
-        self.mode = "steps"
-        self.playback_frames = []
-        self.playback_idx = 0
-        self.playback_timer = Timer()
-        self.frame_duration = 0.01  # 10ms per frame (100 FPS recording)
-        self.playback_left_origin_deg = 0
-        self.playback_right_origin_deg = 0
-        self.position_kp = 0.04
-        self.max_position_correction = 35
 
         """TODO: Add GPS Sensor PID control"""
 
@@ -1392,16 +1028,7 @@ class AutonomousController:
         self.steps = self.step_routine.steps
 
     def use_steps_mode(self):
-        self.mode = "steps"
-    
-    def set_frames(self, frames):
-        """Set playback frames directly (from binary file)."""
-        self.playback_frames = frames
-        self.mode = "movestring"
-    
-    def set_mode(self, mode):
-        """Set autonomous mode: 'steps' or 'movestring'."""
-        self.mode = mode
+        return
 
     def _stop_all_outputs(self):
         self.drivecontroller.update_manually(0, 0)
@@ -1410,72 +1037,18 @@ class AutonomousController:
         self.matchloader.update_manually(0)
 
     def is_finished(self):
-        if self.mode == "movestring":
-            return self.playback_idx >= len(self.playback_frames)
         return self.currentstepidx >= len(self.steps)
     
     def start(self):
         self.timer.reset()
         self.currentstepidx = 0
-        self.playback_idx = 0
-        self.playback_timer.reset()
-        self.playback_left_origin_deg, self.playback_right_origin_deg = self.drivecontroller.get_drive_positions_degrees()
-        if self.mode == "steps" and self.steps:
+        if self.steps:
             self.completesteptime = self.steps[0].duration
         else:
             self.completesteptime = 0
 
     def update(self):
-        if self.mode == "movestring":
-            self._update_movestring()
-        else:
-            self._update_steps()
-    
-    def _update_movestring(self):
-        """Playback recorded frames - one frame per update call for 1:1 timing."""
-        if self.playback_idx >= len(self.playback_frames):
-            # Finished playback
-            self._stop_all_outputs()
-            return
-        
-        # Get current frame and apply it
-        frame = self.playback_frames[self.playback_idx]
-        left = frame[0]
-        right = frame[1]
-        intake_spd = frame[2]
-        outtake_spd = frame[3]
-        matchloader_spd = frame[4]
-        pneumatic_state = frame[5]
-
-        adjusted_left = left
-        adjusted_right = right
-        if len(frame) >= 8:
-            recorded_left_pos_deg = frame[6]
-            recorded_right_pos_deg = frame[7]
-            target_left_pos_deg = self.playback_left_origin_deg + recorded_left_pos_deg
-            target_right_pos_deg = self.playback_right_origin_deg + recorded_right_pos_deg
-            current_left_pos_deg, current_right_pos_deg = self.drivecontroller.get_drive_positions_degrees()
-
-            left_error = target_left_pos_deg - current_left_pos_deg
-            right_error = target_right_pos_deg - current_right_pos_deg
-
-            left_correction = max(-self.max_position_correction, min(self.max_position_correction, left_error * self.position_kp))
-            right_correction = max(-self.max_position_correction, min(self.max_position_correction, right_error * self.position_kp))
-
-            adjusted_left = left + left_correction
-            adjusted_right = right + right_correction
-
-        self.drivecontroller.update_manually(adjusted_left, adjusted_right)
-        self.intake.update_manually(intake_spd)
-        self.outtake.update_manually(outtake_spd)
-        self.matchloader.update_manually(matchloader_spd)
-        
-        # Playback pneumatic states
-        if self.descore is not None:
-            self.descore.update_manually(1 if pneumatic_state else 0)
-        
-        # Advance to next frame
-        self.playback_idx += 1
+        self._update_steps()
     
     def _update_steps(self):
         """Run the active step-based autonomous routine."""
@@ -1570,12 +1143,10 @@ def usercontrol_start():
 # Brain should be defined by default
 brain=Brain()
 controller = Controller()
-record_button = WrappedButton(controller.buttonLeft)  # Left arrow to toggle recording
 brain.screen.set_pen_color(Color.WHITE)
 brain.screen.render()
 logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
-move_recorder = MoveRecorder(brain)  # For recording controller inputs - needs brain for SD card
 descore = ButtonControlledPneumatic(controller.buttonUp, DigitalOut(brain.three_wire_port.a))
 intake = Intake(controller, Motor(Ports.PORT9))
 outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
@@ -1591,25 +1162,26 @@ drivetrain = DriveController(
 )
 
 auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger, descore)
-# Built-in step autonomous (slot 5). Format:
+# Five autonomous step slots. Format:
 # left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
-slot5_steps = StepAutonomousRoutine("Steps Slot 5")
-slot5_steps.add_step(-30, -30, 100, 50, 0, 2, matchloader_toggle_state="b")
-slot5_steps.add_step(0, 0, 100, 50, 0, 5, matchloader_toggle_state="b")
-auton.set_step_routine(slot5_steps)
+slot_routines = {
+    1: StepAutonomousRoutine("Steps Slot 1"),
+    2: StepAutonomousRoutine("Steps Slot 2"),
+    3: StepAutonomousRoutine("Steps Slot 3"),
+    4: StepAutonomousRoutine("Steps Slot 4"),
+    5: StepAutonomousRoutine("Steps Slot 5"),
+}
 
-# Autonomous manager for SD card save/load
-auton_manager = AutonomousManager(brain, logger, auton)
+# Default sample routine in slot 5
+slot_routines[5].add_step(-30, -30, 100, 50, 0, 2, matchloader_toggle_state="b")
+slot_routines[5].add_step(0, 0, 100, 50, 0, 5, matchloader_toggle_state="b")
+
+# Autonomous manager for selecting/testing step slots
+auton_manager = AutonomousManager(brain, logger, auton, slot_routines)
 
 # Config button (right arrow)
 config_button = WrappedButton(controller.buttonRight)
 flipfront_button = WrappedButton(controller.buttonA)
-
-# To use a recorded MoveString instead of steps, uncomment and paste your MoveString:
-# auton.set_movestring("MS1:your_movestring_here")
-# 
-# To switch back to step-based autonomous:
-# auton.set_mode("steps")  # Commented out - auton_manager handles this now
 
 # setup UI
 ui = UI(brain)
@@ -1618,62 +1190,7 @@ ui.add_element(UI_element("button", "Grayson Gimic Bot", x=0, y=0, width=200, he
 ui.add_element(UI_element("button", "", x=200, y=0, width=280, height=35, layer=3, font=FontType.MONO20, color=Color.BLUE, rounded_corners=False, onupdate='self.content = "batt:" + str(brain.battery.capacity()) + "%"'))
 
 # Store references to dynamically added UI elements
-save_slot_buttons = []
 config_slot_buttons = []
-
-def show_save_slot_ui():
-    """Show the save slot selection buttons."""
-    global save_slot_buttons
-    clear_save_slot_ui()
-    
-    button_width = 90
-    button_height = 40
-    start_x = 10
-    start_y = 180
-    spacing = 5
-    
-    # Create slot buttons 1-4
-    for i in range(1, 5):
-        has_data = auton_manager.slot_has_data(i)
-        color = Color.ORANGE if has_data else Color.GREEN
-        label = "Slot " + str(i) + ("*" if has_data else "")
-        btn = UI_element("button", label, 
-                        x=start_x + (i-1) * (button_width + spacing), 
-                        y=start_y,
-                        width=button_width, height=button_height,
-                        layer=4, font=FontType.MONO15, color=color,
-                        onclick='save_to_slot(' + str(i) + ')')
-        save_slot_buttons.append(btn)
-        ui.add_element(btn)
-    
-    # Trash button
-    trash_btn = UI_element("button", "Trash",
-                          x=start_x + 4 * (button_width + spacing),
-                          y=start_y,
-                          width=button_width, height=button_height,
-                          layer=4, font=FontType.MONO15, color=Color.RED,
-                          onclick='trash_recording()')
-    save_slot_buttons.append(trash_btn)
-    ui.add_element(trash_btn)
-
-def clear_save_slot_ui():
-    """Remove save slot buttons from UI."""
-    global save_slot_buttons
-    for btn in save_slot_buttons:
-        ui.remove_element(btn)
-    save_slot_buttons = []
-
-def save_to_slot(slot):
-    """Save pending recording to a slot."""
-    auton_manager.save_to_slot(slot, move_recorder.get_temp_file())
-    auton_manager.end_save_mode()
-    clear_save_slot_ui()
-
-def trash_recording():
-    """Discard the pending recording."""
-    logger.log("Recording discarded")
-    auton_manager.end_save_mode()
-    clear_save_slot_ui()
 
 def show_config_ui():
     """Show the config mode UI for selecting/testing autonomous."""
@@ -1686,20 +1203,12 @@ def show_config_ui():
     start_y = 180
     spacing = 5
     
-    # Create slot buttons 1-5 for selection (slot 5 = built-in steps)
-    for i in range(1, 6):
-        is_steps_slot = i == auton_manager.STEPS_SLOT
-        has_data = auton_manager.slot_has_data(i)
+    # Create slot buttons 1-5 for step autonomous selection
+    for i in range(auton_manager.SLOT_MIN, auton_manager.SLOT_MAX + 1):
         is_selected = auton_manager.selected_slot == i
+        has_data = auton_manager.slot_has_data(i)
 
-        if is_steps_slot:
-            if is_selected:
-                color = Color.CYAN
-                label = "[Steps]"
-            else:
-                color = Color.BLUE
-                label = "Steps"
-        elif is_selected:
+        if is_selected:
             color = Color.CYAN
             label = "[" + str(i) + "]"
         elif has_data:
@@ -1707,7 +1216,7 @@ def show_config_ui():
             label = "Slot " + str(i)
         else:
             color = Color(50, 50, 50)
-            label = "Empty " + str(i)
+            label = "Slot " + str(i)
         btn = UI_element("button", label,
                         x=start_x + (i-1) * (button_width + spacing),
                         y=start_y,
@@ -1786,17 +1295,11 @@ target_framerate = 10
 screenupdatetimer = Timer()
 screenupdatetimer.reset()
 
-# Dedicated timer for consistent recording/playback frame rate
-# Both record and playback advance one frame per FRAME_INTERVAL so timing stays 1:1
+# Dedicated timer for consistent autonomous playback frame rate
+# Autonomous playback advances one step update per FRAME_INTERVAL.
 FRAME_INTERVAL = 0.02  # 20ms per frame = 50 FPS
 frame_timer = Timer()
 frame_timer.reset()
-
-# Helper variables for tracking motor states during recording
-last_intake_speed = 0
-last_outtake_speed = 0
-last_matchloader_speed = 0
-last_pneumatic_state = False
 
 """
 =====================================================================
@@ -1808,34 +1311,21 @@ while True:
         screenupdatetimer.reset()
         ui.update()
         ui.draw()
-        record_button.update_state()
         config_button.update_state()
         flipfront_button.update_state()
         
-        if config_button.pressed() and not auton_manager.save_mode:
+        if config_button.pressed():
             if auton_manager.config_mode:
                 exit_config_mode()
             else:
                 auton_manager.start_config_mode()
                 show_config_ui()
-        
-        if record_button.pressed() and not auton_manager.config_mode and not auton_manager.save_mode:
-            if move_recorder.recording:
-                frame_count = move_recorder.stop_recording()
-                logger.log("Recording stopped. " + str(frame_count) + " frames.")
-                # Show save slot selection UI
-                auton_manager.start_save_mode()
-                show_save_slot_ui()
-            else:
-                move_recorder.start_recording()
-                frame_timer.reset()
-                logger.log("Recording started! Press left arrow to stop.")
 
-        if flipfront_button.pressed() and not auton_manager.config_mode and not auton_manager.save_mode:
+        if flipfront_button.pressed() and not auton_manager.config_mode:
             flipped = drivetrain.toggle_front()
             logger.log("Front flipped" if flipped else "Front normal")
     
-    # Check if a consistent frame tick has elapsed for recording/playback
+    # Check if a consistent frame tick has elapsed for autonomous playback
     frame_tick = frame_timer.time(vex.TimeUnits.SECONDS) >= FRAME_INTERVAL
     if frame_tick:
         frame_timer.reset()
@@ -1860,42 +1350,6 @@ while True:
             matchloader.update_from_controller()
             descore.update_from_controller()
             heightadjuster.update_from_controller()
-            
-            if move_recorder.recording and frame_tick:
-                try:
-                    left_pos_deg, right_pos_deg = drivetrain.get_drive_positions_degrees()
-
-                    if controller.buttonR1.pressing():
-                        current_intake = intake.speed
-                    elif controller.buttonR2.pressing():
-                        current_intake = -intake.speed
-                    else:
-                        current_intake = 0
-                    
-                    if controller.buttonL1.pressing():
-                        current_outtake = outtake.speed
-                    elif controller.buttonL2.pressing():
-                        current_outtake = -outtake.speed
-                    else:
-                        current_outtake = 0
-                    
-                    current_matchloader = 100 if matchloader.toggle_state.state == "a" else 0
-                    
-                    current_pneumatic = descore.toggle_state.state == "a"
-                    
-                    move_recorder.record_frame(
-                        drivetrain.left_speed,
-                        drivetrain.right_speed,
-                        current_intake,
-                        current_outtake,
-                        current_matchloader,
-                        current_pneumatic,
-                        left_pos_deg,
-                        right_pos_deg
-                    )
-                except Exception as e:
-                    logger.error("Recording error: " + str(e))
-                    move_recorder.stop_recording()
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
