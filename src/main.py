@@ -1637,6 +1637,7 @@ while True:
             descore.update_from_controller()
             heightadjuster.update_from_controller()
         Filter.update() # update position estimate
+        logger.log("Pos: x={:.1f}mm y={:.1f}mm h={:.1f}deg".format(Filter.get_estimate().x, Filter.get_estimate().y, Filter.get_estimate().z))
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
