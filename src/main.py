@@ -790,7 +790,7 @@ class DriveController():
         wheel_diameter_mm = 83
         drivetrain_width_mm = 315
         wheel_circumference_mm = wheel_diameter_mm * math.pi
-        gearratio = 60/36 #speed at motor * gearratio = speed at wheel
+        gearratio = 36/60 #speed at motor * gearratio = speed at wheel
         left_speed_dps, right_speed_dps = self.get_motor_speeds()
         left_speed_mps = (left_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
         right_speed_mps = (right_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
@@ -1438,7 +1438,7 @@ outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(
 matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.three_wire_port.b))
 heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
-GPS = GPSSensor(Gps(Ports.PORT11))
+GPS = GPSSensor(Gps(Ports.PORT10))
 GPS.set_origin(105, 128)
 drivetrain = DriveController(
     [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
