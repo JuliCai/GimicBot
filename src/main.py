@@ -640,10 +640,23 @@ class DriveController():
         self.turn_sign = -1     # flip turn direction to restore normal turning
         self.right_side_sign = -1  # preserve prior right-side inversion
         self.front_flipped = False
+        # Encoder sign normalization for odometry/velocity models.
+        # Goal: forward robot motion should read positive on BOTH sides.
+        self.left_encoder_sign = 1.0
+        self.right_encoder_sign = -1.0
+        # Shared drivetrain model constants (used by velocity + odometry).
+        self.wheel_diameter_mm = 83.0
+        self.track_width_mm = 315.0
+        # External ratio: motor 48T driving wheel 60T => 48/60.
+        self.external_gear_ratio = 48.0 / 60.0
         # Per-motor continuous position tracking to handle wrapped encoder angles.
         # Some runtimes return motor.position() modulo 360; unwrapping prevents
         # ±360 jumps that destabilize proportional playback correction.
         self._motor_pos_state = {}
+
+    def get_odometry_constants(self):
+        """Return (wheel_diameter_mm, track_width_mm, external_gear_ratio)."""
+        return self.wheel_diameter_mm, self.track_width_mm, self.external_gear_ratio
 
     def get_joystick_input(self):
         # Treat x as the horizontal (turn) axis and y as the forward/back axis.
@@ -753,8 +766,10 @@ class DriveController():
         right_avg = 0
         if len(self.left_motors) > 0:
             left_avg = sum(self._continuous_motor_position_degrees(motor) for motor in self.left_motors) / len(self.left_motors)
+            left_avg *= self.left_encoder_sign
         if len(self.right_motors) > 0:
             right_avg = sum(self._continuous_motor_position_degrees(motor) for motor in self.right_motors) / len(self.right_motors)
+            right_avg *= self.right_encoder_sign
         return left_avg, right_avg
     
     def get_motor_speeds(self):
@@ -780,22 +795,21 @@ class DriveController():
         rightspeed = 0
         if len(self.left_motors) > 0:
             leftspeed = leftspeedsum / len(self.left_motors)
+            leftspeed *= self.left_encoder_sign
         if len(self.right_motors) > 0:
             rightspeed = rightspeedsum / len(self.right_motors)
+            rightspeed *= self.right_encoder_sign
         return leftspeed, rightspeed
 
     
     def get_velocity_real(self):
         """Estimate current velocity in m/s and z rotation of robot in deg/s based on motor speeds, should be pretty accurate, but will drift over time"""
-        wheel_diameter_mm = 83
-        drivetrain_width_mm = 315
-        wheel_circumference_mm = wheel_diameter_mm * math.pi
-        gearratio = 36/60 #speed at motor * gearratio = speed at wheel
+        wheel_circumference_mm = self.wheel_diameter_mm * math.pi
         left_speed_dps, right_speed_dps = self.get_motor_speeds()
-        left_speed_mps = (left_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
-        right_speed_mps = (right_speed_dps / 360) * wheel_circumference_mm / 1000 * gearratio
+        left_speed_mps = (left_speed_dps / 360) * wheel_circumference_mm / 1000 * self.external_gear_ratio
+        right_speed_mps = (right_speed_dps / 360) * wheel_circumference_mm / 1000 * self.external_gear_ratio
         forward_speed = (left_speed_mps + right_speed_mps) / 2
-        rotation_z_speed = (right_speed_mps - left_speed_mps) / (drivetrain_width_mm / 1000) * (180 / math.pi)
+        rotation_z_speed = (right_speed_mps - left_speed_mps) / (self.track_width_mm / 1000) * (180 / math.pi)
         return forward_speed, rotation_z_speed
 
 
@@ -834,18 +848,34 @@ class KalmanFilter:
         self._q_heading_per_sec = 5.0
 
         # Tunable GPS measurement noise (lower = trust GPS more).
-        self._r_x = 2500.0
-        self._r_y = 2500.0
+        # Increased GPS pull for x/y so position estimate recenters faster.
+        self._r_x = 900.0
+        self._r_y = 900.0
         self._r_h = 25.0
 
         # Robot geometry for odometry model.
         self._wheel_diameter_mm = 83.0
         self._track_width_mm = 300.0
-        # wheel speed = motor speed * (driven/driving)
-        # Keep this consistent with DriveController.get_velocity_real().
-        # Previous value (48/36) over-scaled odometry distance and caused
-        # small forward overshoot before GPS correction settled.
-        self._gear_ratio = 36.0 / 60.0
+        # Physical external gear ratio.
+        self._gear_ratio = 48.0 / 60.0
+        # Empirical scale for odometry model mismatch (scrub, wheel effective
+        # diameter, carpet compression, etc). 1.0 = purely geometric model.
+        self._odom_scale_tune = 1.25
+
+        # GPS position correction safeguards (x/y only).
+        # Hold GPS position corrections while moving quickly to avoid lag pullback.
+        self._gps_position_hold_speed_mmps = 120.0
+        # Ignore very large single-frame GPS position jumps as outliers.
+        self._gps_outlier_residual_mm = 250.0
+        # Cap how much GPS can correct x/y per update (after Kalman gain).
+        self._gps_position_correction_cap_mm = 35.0
+        # Becomes true after we accept at least one trusted GPS x/y correction.
+        self._has_position_lock = False
+        # Persistent re-lock gate for rare bad GPS lock states.
+        self._gps_relock_residual_mm = 300.0
+        self._gps_relock_quality_min = 95
+        self._gps_relock_required_streak = 10
+        self._gps_relock_streak = 0
 
         self._timer = Timer()
         self._timer.reset()
@@ -858,6 +888,10 @@ class KalmanFilter:
         """Return shortest signed angle delta in degrees (measurement - estimate)."""
         delta = (measurement_deg - estimate_deg + 180.0) % 360.0 - 180.0
         return delta
+
+    def _field_heading_to_math_radians(self, heading_deg):
+        """Convert VEX field heading (0°=up, clockwise+) to math radians (0=+x, CCW+)."""
+        return math.radians(90.0 - heading_deg)
 
     def _try_get_gps(self):
         if self.gps is None:
@@ -893,8 +927,11 @@ class KalmanFilter:
         gps_pos = self._try_get_accurate_gps()
         if gps_pos is None:
             gps_pos = self._try_get_gps()
-        if gps_pos is not None:
+        init_quality = self._try_get_gps_quality()
+        init_position_valid = (init_quality is None) or (init_quality >= 80)
+        if gps_pos is not None and init_position_valid:
             self.current_estimate = Vector3D(gps_pos[0], gps_pos[1], gps_pos[2])
+            self._has_position_lock = True
 
         if self.drivetrain is not None:
             try:
@@ -929,23 +966,44 @@ class KalmanFilter:
         self._last_left_deg = left_deg
         self._last_right_deg = right_deg
 
-        wheel_circumference_mm = self._wheel_diameter_mm * math.pi
-        d_left_mm = (d_left_deg / 360.0) * wheel_circumference_mm * self._gear_ratio
-        d_right_mm = (d_right_deg / 360.0) * wheel_circumference_mm * self._gear_ratio
+        wheel_diameter_mm = self._wheel_diameter_mm
+        track_width_mm = self._track_width_mm
+        gear_ratio = self._gear_ratio
+        if self.drivetrain is not None and hasattr(self.drivetrain, "get_odometry_constants"):
+            try:
+                wheel_diameter_mm, track_width_mm, gear_ratio = self.drivetrain.get_odometry_constants()
+            except Exception:
+                pass
+
+        wheel_circumference_mm = wheel_diameter_mm * math.pi
+        # Raw geometric odometry from encoder deltas and physical gear ratio.
+        raw_d_left_mm = (d_left_deg / 360.0) * wheel_circumference_mm * gear_ratio
+        raw_d_right_mm = (d_right_deg / 360.0) * wheel_circumference_mm * gear_ratio
+
+        # Tuned odometry used for state prediction.
+        d_left_mm = raw_d_left_mm * self._odom_scale_tune
+        d_right_mm = raw_d_right_mm * self._odom_scale_tune
 
         d_center_mm = (d_left_mm + d_right_mm) / 2.0
-        d_heading_deg = ((d_right_mm - d_left_mm) / self._track_width_mm) * (180.0 / math.pi)
+        d_heading_deg = ((d_right_mm - d_left_mm) / track_width_mm) * (180.0 / math.pi)
 
-        predicted_heading = self._wrap_heading(self.current_estimate.z + d_heading_deg)
-        heading_rad = math.radians(predicted_heading)
+        previous_heading = self.current_estimate.z
+        predicted_heading = self._wrap_heading(previous_heading + d_heading_deg)
+        # Integrate translation at the midpoint heading over the time step.
+        mid_heading = self._wrap_heading(previous_heading + (d_heading_deg * 0.5))
+        heading_rad = self._field_heading_to_math_radians(mid_heading)
 
         self.current_estimate.x += d_center_mm * math.cos(heading_rad)
         self.current_estimate.y += d_center_mm * math.sin(heading_rad)
         self.current_estimate.z = predicted_heading
 
         # Covariance growth during prediction.
-        motion_scale = abs(d_center_mm) / 10.0
-        turn_scale = abs(d_heading_deg) / 5.0
+        # Base this on raw motion so very large tune factors don't indirectly
+        # force GPS dominance (which can hide tune effects during movement).
+        raw_d_center_mm = (raw_d_left_mm + raw_d_right_mm) / 2.0
+        raw_d_heading_deg = ((raw_d_right_mm - raw_d_left_mm) / track_width_mm) * (180.0 / math.pi)
+        motion_scale = abs(raw_d_center_mm) / 10.0
+        turn_scale = abs(raw_d_heading_deg) / 5.0
         self._p_x += self._q_pos_per_sec * dt_s + motion_scale
         self._p_y += self._q_pos_per_sec * dt_s + motion_scale
         self._p_h += self._q_heading_per_sec * dt_s + turn_scale
@@ -968,6 +1026,7 @@ class KalmanFilter:
         r_x = self._r_x
         r_y = self._r_y
         r_h = self._r_h
+        speed_mmps = 0.0
 
         if quality is not None:
             if quality <= 0:
@@ -990,16 +1049,85 @@ class KalmanFilter:
                 r_y = self._r_y * 2.0
                 r_h = self._r_h * 1.2
 
+        # GPS position can lag during fast motion. Capture speed for gating.
+        if self.drivetrain is not None:
+            try:
+                v_forward_mps, _ = self.drivetrain.get_velocity_real()
+                speed_mmps = abs(v_forward_mps) * 1000.0
+            except Exception:
+                pass
+
+        # While moving quickly, trust odometry for position and keep GPS for heading.
+        if speed_mmps > self._gps_position_hold_speed_mmps:
+            position_valid = False
+
+        # Reject obviously bad GPS position jumps.
+        x_residual = gps_x - self.current_estimate.x
+        y_residual = gps_y - self.current_estimate.y
+
+        # If a large residual persists while stationary with strong signal,
+        # treat this as a stale/bad lock and forcibly re-lock to GPS.
+        residual_mag = math.sqrt((x_residual * x_residual) + (y_residual * y_residual))
+        can_relock = (
+            (speed_mmps <= self._gps_position_hold_speed_mmps)
+            and (quality is not None)
+            and (quality >= self._gps_relock_quality_min)
+            and (residual_mag >= self._gps_relock_residual_mm)
+        )
+        if can_relock:
+            self._gps_relock_streak += 1
+        else:
+            self._gps_relock_streak = 0
+
+        if self._gps_relock_streak >= self._gps_relock_required_streak:
+            self.current_estimate.x = gps_x
+            self.current_estimate.y = gps_y
+            self._p_x = min(self._p_x, self._r_x)
+            self._p_y = min(self._p_y, self._r_y)
+            self._has_position_lock = True
+            self._gps_relock_streak = 0
+            x_residual = 0.0
+            y_residual = 0.0
+
+        if abs(x_residual) > self._gps_outlier_residual_mm or abs(y_residual) > self._gps_outlier_residual_mm:
+            # If we do not yet have a trusted GPS x/y lock, allow one controlled
+            # re-lock while stationary with decent signal so startup races do not
+            # permanently freeze position correction.
+            if (
+                (not self._has_position_lock)
+                and (speed_mmps <= self._gps_position_hold_speed_mmps)
+                and ((quality is None) or (quality >= 90))
+            ):
+                self.current_estimate.x = gps_x
+                self.current_estimate.y = gps_y
+                self._p_x = min(self._p_x, self._r_x)
+                self._p_y = min(self._p_y, self._r_y)
+                self._has_position_lock = True
+                position_valid = False
+            else:
+                position_valid = False
+
         if position_valid:
             # x update
             kx = self._p_x / (self._p_x + r_x)
-            self.current_estimate.x = self.current_estimate.x + kx * (gps_x - self.current_estimate.x)
+            x_correction = kx * x_residual
+            if x_correction > self._gps_position_correction_cap_mm:
+                x_correction = self._gps_position_correction_cap_mm
+            elif x_correction < -self._gps_position_correction_cap_mm:
+                x_correction = -self._gps_position_correction_cap_mm
+            self.current_estimate.x = self.current_estimate.x + x_correction
             self._p_x = (1.0 - kx) * self._p_x
 
             # y update
             ky = self._p_y / (self._p_y + r_y)
-            self.current_estimate.y = self.current_estimate.y + ky * (gps_y - self.current_estimate.y)
+            y_correction = ky * y_residual
+            if y_correction > self._gps_position_correction_cap_mm:
+                y_correction = self._gps_position_correction_cap_mm
+            elif y_correction < -self._gps_position_correction_cap_mm:
+                y_correction = -self._gps_position_correction_cap_mm
+            self.current_estimate.y = self.current_estimate.y + y_correction
             self._p_y = (1.0 - ky) * self._p_y
+            self._has_position_lock = True
 
         if heading_valid:
             # heading update with wrapped innovation
@@ -1039,12 +1167,13 @@ class KalmanFilter:
 
 
 class GPSSensor:
-    def __init__(self, sensor):
+    def __init__(self, sensor, heading_offset_deg=0.0):
         self.sensor = sensor
-        self.last_valid_position = (0.0, 0.0, 0.0)
+        self.heading_offset_deg = float(heading_offset_deg)
+        self.last_valid_position = None
         self.last_valid_heading = 0.0
         self.last_valid_gyro_z = 0
-        self.last_valid_quality = 0
+        self.last_valid_quality = None
 
     def _normalize_heading(self, heading):
         return heading % 360
@@ -1059,7 +1188,7 @@ class GPSSensor:
         try:
             x = self.sensor.x_position(vex.DistanceUnits.MM)
             y = self.sensor.y_position(vex.DistanceUnits.MM)
-            heading = self._normalize_heading(self.sensor.heading())
+            heading = self._normalize_heading(self.sensor.heading() + self.heading_offset_deg)
             position = (x, y, heading)
             self.last_valid_position = position
             self.last_valid_heading = heading
@@ -1069,11 +1198,19 @@ class GPSSensor:
 
     def get_heading(self):
         try:
-            heading = self._normalize_heading(self.sensor.heading())
+            heading = self._normalize_heading(self.sensor.heading() + self.heading_offset_deg)
             self.last_valid_heading = heading
             return heading
         except Exception:
             return self.last_valid_heading
+
+    def set_heading_offset(self, heading_offset_deg):
+        """Set heading correction for mounting orientation mismatch."""
+        try:
+            self.heading_offset_deg = float(heading_offset_deg)
+            return True
+        except Exception:
+            return False
 
     def get_internal_gyro_z(self):
         """get internal stuff with gps_sensor.orientation(axis, units)"""
@@ -1137,11 +1274,17 @@ class PIDController:
         self.output_limits = output_limits
         self._last_error = 0
         self._integral = 0
+
+    def reset(self):
+        self._last_error = 0
+        self._integral = 0
     
-    def compute(self, measurement):
+    def compute(self, measurement, dt=None):
+        if dt is None or dt <= 0:
+            dt = 1.0
         error = self.setpoint - measurement
-        self._integral += error
-        derivative = error - self._last_error
+        self._integral += error * dt
+        derivative = (error - self._last_error) / dt
         output = (self.kp * error) + (self.ki * self._integral) + (self.kd * derivative)
         
         # Apply output limits
@@ -1286,7 +1429,7 @@ class StepAutonomousRoutine:
 
 
 class AutonomousController:
-    def __init__(self, drivecontroller, intake, outtake, matchloader, brain, logger, descore=None):
+    def __init__(self, drivecontroller, intake, outtake, matchloader, brain, logger, descore=None, pose_filter=None, game_state=None):
         self.drivecontroller = drivecontroller
         self.intake = intake
         self.outtake = outtake
@@ -1299,6 +1442,75 @@ class AutonomousController:
         self.completesteptime = 0
         self.matchloader = matchloader
         self.descore = descore
+        self.pose_filter = pose_filter
+        self.game_state = game_state
+
+        # Target navigation state
+        self.target_active = False
+        self.arrived_at_target = False
+        self.target_q4 = None
+        self.target_world = None
+        self.target_angle = None
+        self._target_phase = "idle"
+
+        # Navigation tuning
+        self.target_tolerance_mm = 15.0
+        self.target_heading_tolerance_deg = 3.0
+        self._target_settle_frames = 3
+        self._target_max_drive_speed = 60.0
+        self._target_min_drive_speed = 8.0
+        self._target_max_turn_speed = 40.0
+        self._target_min_turn_speed = 6.0
+        self._target_max_steer_speed = 16.0
+        # Acceleration limits for motion-profiled commands.
+        # Units are in "command-percent per second^2".
+        self._target_drive_accel = 180.0
+        self._target_turn_accel = 220.0
+        self._target_slew_per_update = 4.0
+        self._target_align_tolerance_deg = 3.5
+        self._target_realign_threshold_deg = 18.0
+        self._target_required_in_tolerance_count = self._target_settle_frames
+        self._target_in_tolerance_count = 0
+        self._target_drive_sign = 1.0
+        self._target_choose_direction_on_align = True
+        self._target_align_start_error_deg = 0.0
+        self._target_drive_start_distance_mm = 0.0
+        self._target_final_turn_start_error_deg = 0.0
+        self._target_phase_entry_heading_error_deg = 0.0
+        self._last_left_command = 0.0
+        self._last_right_command = 0.0
+        self._right_motor_sign = 1.0
+        try:
+            if hasattr(self.drivecontroller, "right_side_sign"):
+                self._right_motor_sign = float(self.drivecontroller.right_side_sign)
+        except Exception:
+            pass
+
+        self._target_timer = Timer()
+        self._target_timer.reset()
+        self._target_last_time_s = self._target_timer.time(vex.TimeUnits.SECONDS)
+
+        self._distance_pid = PIDController(
+            kp=0.06,
+            ki=0.0,
+            kd=0.005,
+            setpoint=0,
+            output_limits=(0, self._target_max_drive_speed),
+        )
+        self._path_heading_pid = PIDController(
+            kp=0.30,
+            ki=0.0,
+            kd=0.03,
+            setpoint=0,
+            output_limits=(-self._target_max_steer_speed, self._target_max_steer_speed),
+        )
+        self._final_heading_pid = PIDController(
+            kp=0.65,
+            ki=0.0,
+            kd=0.08,
+            setpoint=0,
+            output_limits=(-self._target_max_turn_speed, self._target_max_turn_speed),
+        )
 
         """TODO: Add GPS Sensor PID control"""
 
@@ -1312,6 +1524,335 @@ class AutonomousController:
 
     def use_steps_mode(self):
         return
+
+    def _wrap_heading(self, heading_deg):
+        return heading_deg % 360
+
+    def _angle_residual(self, measurement_deg, estimate_deg):
+        return (measurement_deg - estimate_deg + 180.0) % 360.0 - 180.0
+
+    def _heading_to_field_vector(self, heading_deg):
+        radians = math.radians(self._wrap_heading(heading_deg))
+        # VEX field heading convention:
+        # 0 deg = +Y, 90 deg = +X, clockwise positive
+        return math.sin(radians), math.cos(radians)
+
+    def _field_vector_to_heading(self, x_component, y_component):
+        heading = math.degrees(math.atan2(x_component, y_component))
+        return self._wrap_heading(heading)
+
+    def _heading_from_target_vector(self, dx, dy):
+        # Convert math angle to VEX field heading.
+        return self._wrap_heading(90.0 - math.degrees(math.atan2(dy, dx)))
+
+    def _apply_quadrant_mirror(self, x_mm, y_mm, heading_deg):
+        quadrant = None
+        if self.game_state is not None:
+            quadrant = self.game_state.quadrant
+
+        mirror_x = False
+        mirror_y = False
+        if quadrant in (GameState.QUADRANT_BLUE_RIGHT, GameState.QUADRANT_BLUE_LEFT):
+            mirror_x = True
+        if quadrant in (GameState.QUADRANT_BLUE_RIGHT, GameState.QUADRANT_RED_RIGHT):
+            mirror_y = True
+
+        tx = -x_mm if mirror_x else x_mm
+        ty = -y_mm if mirror_y else y_mm
+
+        transformed_heading = heading_deg
+        if heading_deg is not None:
+            hvx, hvy = self._heading_to_field_vector(heading_deg)
+            if mirror_x:
+                hvx = -hvx
+            if mirror_y:
+                hvy = -hvy
+            transformed_heading = self._field_vector_to_heading(hvx, hvy)
+
+        return tx, ty, transformed_heading
+
+    def _target_dt(self):
+        now = self._target_timer.time(vex.TimeUnits.SECONDS)
+        dt = now - self._target_last_time_s
+        self._target_last_time_s = now
+        if dt <= 0:
+            return 0.02
+        if dt > 0.25:
+            return 0.25
+        return dt
+
+    def _clamp_speed(self, value):
+        return max(-100, min(100, value))
+
+    def _slew(self, current, target, max_delta):
+        delta = target - current
+        if delta > max_delta:
+            delta = max_delta
+        elif delta < -max_delta:
+            delta = -max_delta
+        return current + delta
+
+    def _command_drive_smoothed(self, left, right):
+        self._last_left_command = self._slew(self._last_left_command, left, self._target_slew_per_update)
+        self._last_right_command = self._slew(self._last_right_command, right, self._target_slew_per_update)
+        self.drivecontroller.update_manually(self._last_left_command, self._last_right_command)
+
+    def _mix_robot_drive(self, linear, turn):
+        """Convert robot-relative linear/turn into motor commands."""
+        left = linear + turn
+        right = linear - turn
+        right *= self._right_motor_sign
+        return self._clamp_speed(left), self._clamp_speed(right)
+
+    def _profile_speed(self, traveled, remaining, accel, max_speed, min_speed, hold_min=True):
+        """Kinematic trapezoid/triangle speed profile.
+
+        Returns a non-negative command magnitude that:
+        - accelerates using distance already traveled,
+        - decelerates using distance remaining,
+        - cruises at max speed when path is long enough.
+        """
+        traveled = max(0.0, traveled)
+        remaining = max(0.0, remaining)
+        accel = max(1e-6, accel)
+
+        accel_limited = math.sqrt(2.0 * accel * traveled) if traveled > 0.0 else 0.0
+        decel_limited = math.sqrt(2.0 * accel * remaining) if remaining > 0.0 else 0.0
+
+        magnitude = min(max_speed, accel_limited, decel_limited)
+        if hold_min and remaining > 0.0 and magnitude < min_speed:
+            magnitude = min_speed
+        return max(0.0, min(max_speed, magnitude))
+
+    def _signed_from_error(self, error, magnitude):
+        if error > 0:
+            return magnitude
+        if error < 0:
+            return -magnitude
+        return 0.0
+
+    def _enter_align_phase(self, current_heading, heading_to_target):
+        self._target_phase = "align"
+        if self._target_choose_direction_on_align:
+            self._target_drive_sign = self._choose_drive_sign(current_heading, heading_to_target)
+            self._target_choose_direction_on_align = False
+        self._target_in_tolerance_count = 0
+        heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+        self._target_align_start_error_deg = max(abs(heading_error), self._target_align_tolerance_deg)
+        self._target_phase_entry_heading_error_deg = heading_error
+        self._final_heading_pid.reset()
+
+    def _enter_drive_phase(self, distance_mm):
+        self._target_phase = "drive"
+        self._target_in_tolerance_count = 0
+        self._target_drive_start_distance_mm = max(distance_mm, self.target_tolerance_mm)
+        self._path_heading_pid.reset()
+
+    def _enter_final_turn_phase(self, current_heading):
+        self._target_phase = "final_turn"
+        self._target_in_tolerance_count = 0
+        heading_error = self._angle_residual(self.target_angle, current_heading)
+        self._target_final_turn_start_error_deg = max(abs(heading_error), self.target_heading_tolerance_deg)
+        self._target_phase_entry_heading_error_deg = heading_error
+        self._final_heading_pid.reset()
+
+    def _choose_drive_sign(self, current_heading, heading_to_target):
+        front_error = self._angle_residual(heading_to_target, current_heading)
+        back_heading = self._wrap_heading(current_heading + 180.0)
+        back_error = self._angle_residual(heading_to_target, back_heading)
+        # Hysteresis margin prevents indecisive front/back flips near the
+        # 90-degree boundary.
+        hysteresis_deg = 8.0
+        if abs(back_error) + hysteresis_deg < abs(front_error):
+            return -1.0
+        return 1.0
+
+    def _heading_error_for_drive_sign(self, current_heading, heading_to_target, drive_sign):
+        if drive_sign < 0:
+            return self._angle_residual(heading_to_target, self._wrap_heading(current_heading + 180.0))
+        return self._angle_residual(heading_to_target, current_heading)
+
+    def _mark_target_complete(self):
+        self.target_active = False
+        self.arrived_at_target = True
+        self._target_phase = "done"
+        self._last_left_command = 0.0
+        self._last_right_command = 0.0
+        self.drivecontroller.update_manually(0, 0)
+
+    def set_target(self, x_mm, y_mm, target_angle=None):
+        """Set movement target using quadrant-4 coordinates, mirrored to startup quadrant."""
+        transformed_x, transformed_y, transformed_heading = self._apply_quadrant_mirror(x_mm, y_mm, target_angle)
+
+        self.target_q4 = (x_mm, y_mm, target_angle)
+        self.target_world = (transformed_x, transformed_y)
+        self.target_angle = transformed_heading
+        self.arrived_at_target = False
+        self.target_active = True
+        self._target_phase = "align"
+        self._target_in_tolerance_count = 0
+        self._target_drive_sign = 1.0
+        self._target_choose_direction_on_align = True
+        self._target_align_start_error_deg = 0.0
+        self._target_drive_start_distance_mm = 0.0
+        self._target_final_turn_start_error_deg = 0.0
+        self._target_phase_entry_heading_error_deg = 0.0
+
+        self._distance_pid.reset()
+        self._path_heading_pid.reset()
+        self._final_heading_pid.reset()
+
+        self._target_timer.reset()
+        self._target_last_time_s = self._target_timer.time(vex.TimeUnits.SECONDS)
+        self._last_left_command = 0.0
+        self._last_right_command = 0.0
+
+        self.logger.log(
+            "Target set (q4): ("
+            + str(int(x_mm))
+            + ", "
+            + str(int(y_mm))
+            + ") -> ("
+            + str(int(transformed_x))
+            + ", "
+            + str(int(transformed_y))
+            + ")"
+        )
+
+    def target_update(self):
+        """Three-phase target navigation.
+
+        1) align: rotate to face toward/away from target (shortest wrapped error)
+        2) drive: move straight with heading PID correction
+        3) final_turn: rotate to desired final heading (optional)
+        """
+        if not self.target_active or self.target_world is None:
+            return
+        if self.pose_filter is None:
+            self.logger.error("Target mode needs pose filter")
+            self.target_active = False
+            return
+
+        pose = self.pose_filter.get_estimate()
+        if pose is None:
+            return
+
+        dt = self._target_dt()
+        target_x, target_y = self.target_world
+
+        dx = target_x - pose.x
+        dy = target_y - pose.y
+        distance_mm = math.sqrt(dx * dx + dy * dy)
+        current_heading = self._wrap_heading(pose.z)
+        if distance_mm > 1e-6:
+            heading_to_target = self._heading_from_target_vector(dx, dy)
+        else:
+            heading_to_target = current_heading
+
+        if self._target_phase == "align":
+            self._enter_align_phase(current_heading, heading_to_target)
+
+        if self._target_phase == "align":
+            heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+            abs_error = abs(heading_error)
+
+            if abs_error <= self._target_align_tolerance_deg:
+                self._target_in_tolerance_count += 1
+            else:
+                self._target_in_tolerance_count = 0
+
+            if self._target_in_tolerance_count >= self._target_settle_frames:
+                self._enter_drive_phase(distance_mm)
+                self._command_drive_smoothed(0.0, 0.0)
+                return
+
+            turned = max(0.0, self._target_align_start_error_deg - abs_error)
+            turn_mag = self._profile_speed(
+                traveled=turned,
+                remaining=abs_error,
+                accel=self._target_turn_accel,
+                max_speed=self._target_max_turn_speed,
+                min_speed=self._target_min_turn_speed,
+                hold_min=True,
+            )
+            turn_cmd = self._signed_from_error(heading_error, turn_mag)
+            left_cmd, right_cmd = self._mix_robot_drive(0.0, turn_cmd)
+            self._command_drive_smoothed(left_cmd, right_cmd)
+            return
+
+        if self._target_phase == "drive":
+            if distance_mm <= self.target_tolerance_mm:
+                self._target_in_tolerance_count += 1
+            else:
+                self._target_in_tolerance_count = 0
+
+            if self._target_in_tolerance_count >= self._target_required_in_tolerance_count:
+                self._command_drive_smoothed(0, 0)
+                if self.target_angle is None:
+                    self._mark_target_complete()
+                else:
+                    self._enter_final_turn_phase(current_heading)
+                return
+
+            heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+
+            if abs(heading_error) > self._target_realign_threshold_deg:
+                # Keep current direction unless a full re-choose is requested.
+                self._target_choose_direction_on_align = False
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0, 0)
+                return
+
+            traveled = max(0.0, self._target_drive_start_distance_mm - distance_mm)
+            drive_mag = self._profile_speed(
+                traveled=traveled,
+                remaining=distance_mm,
+                accel=self._target_drive_accel,
+                max_speed=self._target_max_drive_speed,
+                min_speed=self._target_min_drive_speed,
+                hold_min=(distance_mm > self.target_tolerance_mm),
+            )
+
+            self._path_heading_pid.setpoint = 0
+            steering = self._path_heading_pid.compute(-heading_error, dt=dt)
+            steer_cap = min(self._target_max_steer_speed, max(6.0, drive_mag * 0.4))
+            steering = max(-steer_cap, min(steer_cap, steering))
+
+            linear = self._target_drive_sign * drive_mag
+            left_cmd, right_cmd = self._mix_robot_drive(linear, steering)
+            self._command_drive_smoothed(left_cmd, right_cmd)
+            return
+
+        if self._target_phase == "final_turn":
+            if self.target_angle is None:
+                self._mark_target_complete()
+                return
+
+            heading_error = self._angle_residual(self.target_angle, current_heading)
+            abs_error = abs(heading_error)
+
+            if abs_error <= self.target_heading_tolerance_deg:
+                self._target_in_tolerance_count += 1
+            else:
+                self._target_in_tolerance_count = 0
+
+            if self._target_in_tolerance_count >= self._target_settle_frames:
+                self._mark_target_complete()
+                return
+
+            turned = max(0.0, self._target_final_turn_start_error_deg - abs_error)
+            turn_mag = self._profile_speed(
+                traveled=turned,
+                remaining=abs_error,
+                accel=self._target_turn_accel,
+                max_speed=self._target_max_turn_speed,
+                min_speed=self._target_min_turn_speed,
+                hold_min=True,
+            )
+            turn_cmd = self._signed_from_error(heading_error, turn_mag)
+            left_cmd, right_cmd = self._mix_robot_drive(0.0, turn_cmd)
+            self._command_drive_smoothed(left_cmd, right_cmd)
+            return
 
     def _stop_all_outputs(self):
         self.drivecontroller.update_manually(0, 0)
@@ -1331,7 +1872,10 @@ class AutonomousController:
             self.completesteptime = 0
 
     def update(self):
-        self._update_steps()
+        if self.target_active:
+            self.target_update()
+        else:
+            self._update_steps()
     
     def _update_steps(self):
         """Run the active step-based autonomous routine."""
@@ -1414,9 +1958,50 @@ class Toggled:
 
     def get_state(self):
         return self.state
+
+
+class GameState:
+    """Tracks detected startup field quadrant.
+
+    Quadrant mapping:
+    1 = blue right
+    2 = blue left
+    3 = red right
+    4 = red left
+    """
+    QUADRANT_BLUE_RIGHT = 1
+    QUADRANT_BLUE_LEFT = 2
+    QUADRANT_RED_RIGHT = 3
+    QUADRANT_RED_LEFT = 4
+
+    def __init__(self):
+        self.quadrant = None
+
+    def set_from_position(self, x_mm, y_mm):
+        # Color from x sign: x+ = blue, x- = red
+        # Side from y sign: y+ = right, y- = left
+        if x_mm > 0:
+            self.quadrant = self.QUADRANT_BLUE_RIGHT if y_mm >= 0 else self.QUADRANT_BLUE_LEFT
+        elif x_mm < 0:
+            self.quadrant = self.QUADRANT_RED_RIGHT if y_mm >= 0 else self.QUADRANT_RED_LEFT
+        else:
+            self.quadrant = None
+        return self.quadrant
+
+    def get_label(self):
+        if self.quadrant == self.QUADRANT_BLUE_RIGHT:
+            return "blue right"
+        if self.quadrant == self.QUADRANT_BLUE_LEFT:
+            return "blue left"
+        if self.quadrant == self.QUADRANT_RED_RIGHT:
+            return "red right"
+        if self.quadrant == self.QUADRANT_RED_LEFT:
+            return "red left"
+        return "unknown"
         
 def autonomous_start():
-    auton.start()
+    # Q4-referenced target; set_target mirrors for detected startup quadrant.
+    auton.set_target(-1200, -900, None)
     logger.log("Autonomous started.")
 
 def usercontrol_start():
@@ -1442,8 +2027,16 @@ outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(
 matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.three_wire_port.b))
 heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
-GPS = GPSSensor(Gps(Ports.PORT10))
-GPS.set_origin(105, 128)
+# GPS mounting relative to robot center:
+# +x = right, +y = forward. Rear-left mount => negative x and y.
+GPS_MOUNT_X_MM = 105
+GPS_MOUNT_Y_MM = 68
+# If sensor/device orientation is flipped 180° relative to robot forward,
+# keep this at 180.0. If heading is already correct, set to 0.0.
+GPS_HEADING_OFFSET_DEG = 180.0
+
+GPS = GPSSensor(Gps(Ports.PORT10), heading_offset_deg=GPS_HEADING_OFFSET_DEG)
+GPS.set_origin(GPS_MOUNT_X_MM, GPS_MOUNT_Y_MM)
 drivetrain = DriveController(
     [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
     [Motor(Ports.PORT1), Motor(Ports.PORT2), Motor(Ports.PORT3)],
@@ -1451,7 +2044,32 @@ drivetrain = DriveController(
 )
 Filter = KalmanFilter(GPS, drivetrain)
 
-auton = AutonomousController(drivetrain, intake, outtake, matchloader, brain, logger, descore)
+# Detect startup field quadrant from GPS x/y position.
+# x > 0 = blue, x < 0 = red
+# y > 0 = right, y < 0 = left
+game_state = GameState()
+startup_position = GPS.get_accurate_reading(samples=5, delay_ms=40)
+if startup_position is not None:
+    startup_x, startup_y, _ = startup_position
+    quadrant = game_state.set_from_position(startup_x, startup_y)
+    if quadrant is not None:
+        logger.log("Detected startup quadrant: " + str(quadrant) + " (" + game_state.get_label() + ")")
+    else:
+        logger.warn("Detected startup quadrant: unknown")
+else:
+    logger.warn("Detected startup quadrant: unknown")
+
+auton = AutonomousController(
+    drivetrain,
+    intake,
+    outtake,
+    matchloader,
+    brain,
+    logger,
+    descore,
+    pose_filter=Filter,
+    game_state=game_state,
+)
 # Five autonomous step slots. Format:
 # left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
 slot_routines = {
@@ -1641,7 +2259,6 @@ while True:
             descore.update_from_controller()
             heightadjuster.update_from_controller()
         Filter.update() # update position estimate
-        logger.log("Pos: x={:.1f}mm y={:.1f}mm h={:.1f}deg".format(Filter.get_estimate().x, Filter.get_estimate().y, Filter.get_estimate().z))
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
