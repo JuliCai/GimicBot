@@ -642,8 +642,11 @@ class DriveController():
         self.front_flipped = False
         # Encoder sign normalization for odometry/velocity models.
         # Goal: forward robot motion should read positive on BOTH sides.
-        self.left_encoder_sign = 1.0
-        self.right_encoder_sign = -1.0
+        # With current drive mixing/inversion (`forward_sign=-1`,
+        # `right_side_sign=-1`), left motors report negative and right motors
+        # report positive during physical forward motion. Normalize that here.
+        self.left_encoder_sign = -1.0
+        self.right_encoder_sign = 1.0
         # Shared drivetrain model constants (used by velocity + odometry).
         self.wheel_diameter_mm = 83.0
         self.track_width_mm = 315.0
@@ -709,6 +712,28 @@ class DriveController():
     def update_manually(self, left, right):
         self.left_speed = max(-100, min(100, left))
         self.right_speed = max(-100, min(100, right))
+
+    def mix_robot_command(self, forward_cmd, turn_cmd, apply_front_flip=False):
+        """Map robot-centric forward/turn commands into left/right motor speeds.
+
+        This intentionally uses the same inversion/sign logic as driver control
+        (`forward_sign`, `turn_sign`, `right_side_sign`) so autonomous and
+        teleop turning behavior stay consistent.
+        """
+        forward = self.forward_sign * forward_cmd
+        turn = self.turn_sign * turn_cmd
+
+        if apply_front_flip and self.front_flipped:
+            forward = -forward
+            turn = turn
+
+        left = forward + turn
+        right = forward - turn
+        right *= self.right_side_sign
+
+        left = max(-100, min(100, left))
+        right = max(-100, min(100, right))
+        return left, right
 
     def update_motor_speeds(self):
         for left_motor in self.left_motors:
@@ -845,13 +870,16 @@ class KalmanFilter:
 
         # Tunable process noise (higher = trust odometry less).
         self._q_pos_per_sec = 20.0
-        self._q_heading_per_sec = 5.0
+        # Heading process noise kept low because we predict heading from
+        # GPS gyro rate (high-trust yaw rate source).
+        self._q_heading_per_sec = 1.0
 
         # Tunable GPS measurement noise (lower = trust GPS more).
-        # Increased GPS pull for x/y so position estimate recenters faster.
-        self._r_x = 900.0
-        self._r_y = 900.0
-        self._r_h = 25.0
+        # Heavily de-weight GPS x/y after startup to avoid long-run field-code drift.
+        self._r_x = 5000.0
+        self._r_y = 5000.0
+        # Trust GPS heading strongly.
+        self._r_h = 4.0
 
         # Robot geometry for odometry model.
         self._wheel_diameter_mm = 83.0
@@ -860,15 +888,17 @@ class KalmanFilter:
         self._gear_ratio = 48.0 / 60.0
         # Empirical scale for odometry model mismatch (scrub, wheel effective
         # diameter, carpet compression, etc). 1.0 = purely geometric model.
-        self._odom_scale_tune = 1.25
+        self._odom_scale_tune = 1.10
 
         # GPS position correction safeguards (x/y only).
         # Hold GPS position corrections while moving quickly to avoid lag pullback.
-        self._gps_position_hold_speed_mmps = 120.0
+        self._gps_position_hold_speed_mmps = 90.0
+        # Only accept GPS x/y corrections at very strong quality.
+        self._gps_position_quality_min = 95
         # Ignore very large single-frame GPS position jumps as outliers.
         self._gps_outlier_residual_mm = 250.0
         # Cap how much GPS can correct x/y per update (after Kalman gain).
-        self._gps_position_correction_cap_mm = 35.0
+        self._gps_position_correction_cap_mm = 8.0
         # Becomes true after we accept at least one trusted GPS x/y correction.
         self._has_position_lock = False
         # Persistent re-lock gate for rare bad GPS lock states.
@@ -876,6 +906,14 @@ class KalmanFilter:
         self._gps_relock_quality_min = 95
         self._gps_relock_required_streak = 10
         self._gps_relock_streak = 0
+        # Catastrophic mismatch recovery: estimate is far from GPS.
+        self._gps_catastrophic_residual_mm = 1200.0
+        self._gps_catastrophic_quality_min = 85
+        self._gps_catastrophic_speed_mmps = 800.0
+        self._gps_catastrophic_required_streak = 2
+        self._gps_catastrophic_streak = 0
+        # Minimum quality required for strict recenter-from-GPS helper.
+        self._gps_recenter_quality_min = 55
 
         self._timer = Timer()
         self._timer.reset()
@@ -918,6 +956,16 @@ class KalmanFilter:
             return self.gps.get_quality()
         except Exception:
             return None
+
+    def _try_get_gyro_rate_z_dps(self):
+        if self.gps is None:
+            return None
+        try:
+            if hasattr(self.gps, "get_gyro_rate_z"):
+                return self.gps.get_gyro_rate_z()
+        except Exception:
+            return None
+        return None
 
     def _initialize_if_needed(self):
         if self._initialized:
@@ -985,7 +1033,15 @@ class KalmanFilter:
         d_right_mm = raw_d_right_mm * self._odom_scale_tune
 
         d_center_mm = (d_left_mm + d_right_mm) / 2.0
-        d_heading_deg = ((d_right_mm - d_left_mm) / track_width_mm) * (180.0 / math.pi)
+        # Wheel-based heading delta kept as fallback only.
+        d_heading_odom_deg = ((d_right_mm - d_left_mm) / track_width_mm) * (180.0 / math.pi)
+
+        # Primary heading prediction source: GPS internal gyro yaw rate.
+        gyro_rate_z_dps = self._try_get_gyro_rate_z_dps()
+        if gyro_rate_z_dps is None:
+            d_heading_deg = d_heading_odom_deg
+        else:
+            d_heading_deg = gyro_rate_z_dps * dt_s
 
         previous_heading = self.current_estimate.z
         predicted_heading = self._wrap_heading(previous_heading + d_heading_deg)
@@ -1001,7 +1057,7 @@ class KalmanFilter:
         # Base this on raw motion so very large tune factors don't indirectly
         # force GPS dominance (which can hide tune effects during movement).
         raw_d_center_mm = (raw_d_left_mm + raw_d_right_mm) / 2.0
-        raw_d_heading_deg = ((raw_d_right_mm - raw_d_left_mm) / track_width_mm) * (180.0 / math.pi)
+        raw_d_heading_deg = d_heading_deg
         motion_scale = abs(raw_d_center_mm) / 10.0
         turn_scale = abs(raw_d_heading_deg) / 5.0
         self._p_x += self._q_pos_per_sec * dt_s + motion_scale
@@ -1038,16 +1094,13 @@ class KalmanFilter:
                 # Scale heading noise up as quality decreases.
                 q_scale = max(1.0, (100.0 - quality) / 20.0)
                 r_h = self._r_h * q_scale
-            elif quality < 90:
-                # Keep heading correction; heavily de-weight position correction.
-                r_x = self._r_x * 4.0
-                r_y = self._r_y * 4.0
-                r_h = self._r_h * 1.5
-            elif quality < 95:
-                # Mildly de-weight GPS correction near the degradation band.
-                r_x = self._r_x * 2.0
-                r_y = self._r_y * 2.0
-                r_h = self._r_h * 1.2
+            elif quality < self._gps_position_quality_min:
+                # Keep heading correction, but block GPS x/y below strong lock.
+                position_valid = False
+                if quality < 90:
+                    r_h = self._r_h * 1.5
+                else:
+                    r_h = self._r_h * 1.2
 
         # GPS position can lag during fast motion. Capture speed for gating.
         if self.drivetrain is not None:
@@ -1068,6 +1121,30 @@ class KalmanFilter:
         # If a large residual persists while stationary with strong signal,
         # treat this as a stale/bad lock and forcibly re-lock to GPS.
         residual_mag = math.sqrt((x_residual * x_residual) + (y_residual * y_residual))
+
+        # Fast catastrophic recovery for very large estimate/GPS divergence.
+        catastrophic_relock = (
+            (speed_mmps <= self._gps_catastrophic_speed_mmps)
+            and (quality is not None)
+            and (quality >= self._gps_catastrophic_quality_min)
+            and (residual_mag >= self._gps_catastrophic_residual_mm)
+        )
+        if catastrophic_relock:
+            self._gps_catastrophic_streak += 1
+        else:
+            self._gps_catastrophic_streak = 0
+
+        if self._gps_catastrophic_streak >= self._gps_catastrophic_required_streak:
+            self.current_estimate.x = gps_x
+            self.current_estimate.y = gps_y
+            self._p_x = min(self._p_x, self._r_x)
+            self._p_y = min(self._p_y, self._r_y)
+            self._has_position_lock = True
+            self._gps_catastrophic_streak = 0
+            self._gps_relock_streak = 0
+            x_residual = 0.0
+            y_residual = 0.0
+
         can_relock = (
             (speed_mmps <= self._gps_position_hold_speed_mmps)
             and (quality is not None)
@@ -1141,6 +1218,9 @@ class KalmanFilter:
             return
         try:
             v_forward_mps, v_yaw_dps = self.drivetrain.get_velocity_real()
+            gps_yaw_rate = self._try_get_gyro_rate_z_dps()
+            if gps_yaw_rate is not None:
+                v_yaw_dps = gps_yaw_rate
             self.current_velocity = Vector3D(v_forward_mps, 0.0, v_yaw_dps)
         except Exception:
             # Keep last known velocity.
@@ -1159,6 +1239,36 @@ class KalmanFilter:
         self._correct_with_gps()
         self._update_velocity_estimate()
 
+    def force_recenter_from_gps(self):
+        """Force x/y/heading recenter from current GPS when quality is usable."""
+        gps_pos = self._try_get_accurate_gps()
+        if gps_pos is None:
+            gps_pos = self._try_get_gps()
+        quality = self._try_get_gps_quality()
+        if gps_pos is None:
+            return False
+        if quality is not None and quality < self._gps_recenter_quality_min:
+            return False
+
+        return self.force_recenter(gps_pos[0], gps_pos[1], gps_pos[2])
+
+    def force_recenter(self, x_mm, y_mm, heading_deg):
+        """Force x/y/heading recenter from a supplied pose reading."""
+        try:
+            self.current_estimate.x = x_mm
+            self.current_estimate.y = y_mm
+            self.current_estimate.z = self._wrap_heading(heading_deg)
+        except Exception:
+            return False
+
+        self._p_x = min(self._p_x, self._r_x)
+        self._p_y = min(self._p_y, self._r_y)
+        self._p_h = min(self._p_h, self._r_h)
+        self._has_position_lock = True
+        self._gps_relock_streak = 0
+        self._gps_catastrophic_streak = 0
+        return True
+
     def get_estimate(self):
         return self.current_estimate
 
@@ -1173,6 +1283,7 @@ class GPSSensor:
         self.last_valid_position = None
         self.last_valid_heading = 0.0
         self.last_valid_gyro_z = 0
+        self.last_valid_gyro_rate_z = 0.0
         self.last_valid_quality = None
 
     def _normalize_heading(self, heading):
@@ -1220,6 +1331,20 @@ class GPSSensor:
             return orientation
         except Exception:
             return self.last_valid_gyro_z
+
+    def get_gyro_rate_z(self):
+        """Get GPS gyro Z-axis angular velocity in degrees/sec."""
+        try:
+            rate = self.sensor.gyro_rate(vex.AxisType.ZAXIS, vex.VelocityUnits.DPS)
+            self.last_valid_gyro_rate_z = rate
+            return rate
+        except Exception:
+            try:
+                rate = self.sensor.gyro_rate(AxisType.ZAXIS, VelocityUnits.DPS)
+                self.last_valid_gyro_rate_z = rate
+                return rate
+            except Exception:
+                return self.last_valid_gyro_rate_z
 
     def get_quality(self):
         """Get current GPS signal quality percentage (0-100)."""
@@ -1402,26 +1527,54 @@ class ButtonControlledPneumatic:
 
 # Autonomous classes
 class AutonomousStep:
-    def __init__(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state=None):
-        self.left = left
-        self.right = right
-        self.intake_speed = intake_speed
-        self.outtake_speed = outtake_speed
-        self.matchloader_speed = matchloader_speed
-        self.duration = duration
-        self.matchloader_toggle_state = matchloader_toggle_state
+    """One autonomous step.
+
+    Constructor format:
+    AutonomousStep(x, y, heading=None, intake=0, outtake=0, match=None, descore=None, delay=0)
+
+    None keeps the previous state for that field.
+    Pneumatic fields (`match`, `descore`) accept True, False, or None.
+    """
+    def __init__(self, x, y, heading=None, intake=0, outtake=0, match=None, descore=None, delay=0.0, Descore=None):
+        if Descore is not None and descore is None:
+            descore = Descore
+        self.x = x
+        self.y = y
+        self.heading = heading
+        self.intake = intake
+        self.outtake = outtake
+        self.match = match
+        self.descore = descore
+        self.delay = delay
+
+    @staticmethod
+    def from_definition(step_definition):
+        if isinstance(step_definition, AutonomousStep):
+            return step_definition
+        if len(step_definition) < 2:
+            raise ValueError("Step requires at least x and y")
+        x = step_definition[0]
+        y = step_definition[1]
+        heading = step_definition[2] if len(step_definition) >= 3 else None
+        intake = step_definition[3] if len(step_definition) >= 4 else 0
+        outtake = step_definition[4] if len(step_definition) >= 5 else 0
+        match = step_definition[5] if len(step_definition) >= 6 else None
+        descore = step_definition[6] if len(step_definition) >= 7 else None
+        delay = step_definition[7] if len(step_definition) >= 8 else 0.0
+        return AutonomousStep(x, y, heading=heading, intake=intake, outtake=outtake, match=match, descore=descore, delay=delay)
 
 
 class StepAutonomousRoutine:
     """Container for step-based autonomous sequences."""
     def __init__(self, name="Steps", steps=None):
         self.name = name
-        self.steps = list(steps) if steps is not None else []
+        self.steps = []
+        if steps is not None:
+            for step_definition in steps:
+                self.add_step(step_definition)
 
-    def add_step(self, left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state=None):
-        self.steps.append(
-            AutonomousStep(left, right, intake_speed, outtake_speed, matchloader_speed, duration, matchloader_toggle_state)
-        )
+    def add_step(self, step_definition):
+        self.steps.append(AutonomousStep.from_definition(step_definition))
         return self
 
     def clear(self):
@@ -1440,6 +1593,19 @@ class AutonomousController:
         self.timer = Timer()
         self.currentstepidx = 0
         self.completesteptime = 0
+        self._active_step_index = -1
+        self._active_step_same_position = False
+        self._active_step_delay_until_s = None
+        self._active_step_started = False
+        self._step_heading_in_tolerance_count = 0
+        self._last_step_x = None
+        self._last_step_y = None
+        self._last_step_heading = None
+        self._last_step_intake = 0
+        self._last_step_outtake = 0
+        self._last_step_match = None
+        self._last_step_descore = None
+        self._last_step_delay = 0.0
         self.matchloader = matchloader
         self.descore = descore
         self.pose_filter = pose_filter
@@ -1451,38 +1617,100 @@ class AutonomousController:
         self.target_q4 = None
         self.target_world = None
         self.target_angle = None
+        self._target_queue = []
         self._target_phase = "idle"
+        # Simpler deterministic target runner (turn, drive, final turn).
+        self._simple_nav_enabled = False
+        self._simple_turn_speed_pct = 36.0
+        self._simple_drive_speed_pct = 72.0
+        self._simple_turn_tolerance_deg = 2.0
+        self._simple_drive_tolerance_deg = 18.0
 
         # Navigation tuning
-        self.target_tolerance_mm = 15.0
+        # Practical arrival tolerance for GPS-based navigation.
+        # Keep this close to scoring needs while still tolerating GPS jitter.
+        self.target_tolerance_mm = 40.0
+        self._target_arrival_hysteresis_mm = 28.0
+        self._target_arrival_required_no_heading = 1
+        self._target_approach_slow_distance_mm = 560.0
+        self._target_approach_speed_per_mm = 0.12
         self.target_heading_tolerance_deg = 3.0
         self._target_settle_frames = 3
-        self._target_max_drive_speed = 60.0
-        self._target_min_drive_speed = 8.0
-        self._target_max_turn_speed = 40.0
-        self._target_min_turn_speed = 6.0
-        self._target_max_steer_speed = 16.0
+        self._target_max_drive_speed = 54.0
+        self._target_min_drive_speed = 6.0
+        self._target_max_turn_speed = 46.0
+        self._target_min_turn_speed = 5.0
+        self._target_turn_full_error_deg = 90.0
+        # Degrees used for turn accel/decel ramps. If total turn is larger than
+        # 2*ramp, controller cruises at max speed between ramps.
+        self._target_turn_ramp_deg = 28.0
+        self._target_max_steer_speed = 12.0
         # Acceleration limits for motion-profiled commands.
         # Units are in "command-percent per second^2".
-        self._target_drive_accel = 180.0
+        self._target_drive_accel = 120.0
         self._target_turn_accel = 220.0
         self._target_slew_per_update = 4.0
         self._target_align_tolerance_deg = 3.5
+        self._target_align_live_tolerance_deg = 15.0
+        # Wider band used only to declare align settled (reduces chatter).
+        self._target_align_settle_tolerance_deg = 6.0
+        # Refresh frozen align goal only when the target bearing itself drifts
+        # away from the frozen goal by this many degrees.
+        self._target_align_goal_refresh_threshold_deg = 22.0
         self._target_realign_threshold_deg = 18.0
+        self._target_realign_close_boost_deg = 26.0
+        self._target_realign_close_distance_mm = 220.0
+        self._target_live_realign_error_deg_far = 110.0
+        self._target_live_realign_error_deg_close = 55.0
+        self._target_live_realign_close_distance_mm = 200.0
         self._target_required_in_tolerance_count = self._target_settle_frames
         self._target_in_tolerance_count = 0
+        self._target_arrival_in_tolerance_count = 0
         self._target_drive_sign = 1.0
         self._target_choose_direction_on_align = True
         self._target_align_start_error_deg = 0.0
+        self._target_align_goal_heading_deg = None
         self._target_drive_start_distance_mm = 0.0
         self._target_final_turn_start_error_deg = 0.0
         self._target_phase_entry_heading_error_deg = 0.0
+        self._target_prev_phase_heading_error_deg = None
+        self._target_last_turn_cmd = 0.0
+        self._target_turn_bad_streak = 0
+        self._target_last_distance_mm = None
+        self._target_drive_away_streak = 0
+        self._target_drive_away_streak_required = 6
+        self._target_drive_away_delta_mm = 5.0
+        self._target_auto_drive_sign_flip_enabled = False
+        self._target_turn_flip_streak_required = 4
+        self._target_turn_error_increase_deg = 1.0
+        self._target_auto_turn_sign_enabled = False
+        # Path-locked drive segment state (more odom-like, less GPS chasing).
+        self._target_drive_start_x_mm = 0.0
+        self._target_drive_start_y_mm = 0.0
+        self._target_drive_unit_x = 0.0
+        self._target_drive_unit_y = 0.0
+        self._target_drive_path_length_mm = 0.0
+        self._target_drive_heading_locked_deg = 0.0
+        self._target_drive_best_distance_mm = 0.0
+        self._target_drive_regress_streak = 0
+        self._target_drive_regress_delta_mm = 18.0
+        self._target_drive_regress_streak_required = 6
+        self._target_pose_jump_max_mm = 220.0
+        self._target_last_pose_x_mm = None
+        self._target_last_pose_y_mm = None
+        self._target_debug_enabled = True
+        self._target_debug_interval_s = 0.20
+        self._target_debug_last_log_s = -999.0
         self._last_left_command = 0.0
         self._last_right_command = 0.0
         self._right_motor_sign = 1.0
+        self._target_turn_sign = 1.0
         try:
             if hasattr(self.drivecontroller, "right_side_sign"):
                 self._right_motor_sign = float(self.drivecontroller.right_side_sign)
+            # Keep autonomous turning polarity aligned with driver controls.
+            if hasattr(self.drivecontroller, "turn_sign"):
+                self._target_turn_sign = float(self.drivecontroller.turn_sign)
         except Exception:
             pass
 
@@ -1498,9 +1726,9 @@ class AutonomousController:
             output_limits=(0, self._target_max_drive_speed),
         )
         self._path_heading_pid = PIDController(
-            kp=0.30,
+            kp=0.22,
             ki=0.0,
-            kd=0.03,
+            kd=0.02,
             setpoint=0,
             output_limits=(-self._target_max_steer_speed, self._target_max_steer_speed),
         )
@@ -1515,7 +1743,7 @@ class AutonomousController:
         """TODO: Add GPS Sensor PID control"""
 
     def add_step(self, step):
-        self.step_routine.steps.append(step)
+        self.step_routine.steps.append(AutonomousStep.from_definition(step))
 
     def set_step_routine(self, routine):
         """Set the active step-based autonomous routine."""
@@ -1581,6 +1809,57 @@ class AutonomousController:
             return 0.25
         return dt
 
+    def _target_debug_log(self, phase, distance_mm, current_heading, heading_to_target, pose_x, pose_y, target_x, target_y):
+        if not self._target_debug_enabled:
+            return
+
+        now = self._target_timer.time(vex.TimeUnits.SECONDS)
+        if (now - self._target_debug_last_log_s) < self._target_debug_interval_s:
+            return
+        self._target_debug_last_log_s = now
+
+        front_error = self._angle_residual(heading_to_target, current_heading)
+        back_error = self._angle_residual(heading_to_target, self._wrap_heading(current_heading + 180.0))
+        phase_error = front_error if self._target_drive_sign >= 0 else back_error
+        if phase == "align" and self._target_align_goal_heading_deg is not None:
+            phase_error = self._angle_residual(self._target_align_goal_heading_deg, current_heading)
+        if phase == "final_turn" and self.target_angle is not None:
+            phase_error = self._angle_residual(self.target_angle, current_heading)
+
+        print(
+            "TDBG p="
+            + str(phase)
+            + " pos=("
+            + str(int(pose_x))
+            + ","
+            + str(int(pose_y))
+            + ")"
+            + " tgt=("
+            + str(int(target_x))
+            + ","
+            + str(int(target_y))
+            + ")"
+            + " d="
+            + str(int(distance_mm))
+            + " h="
+            + str(round(current_heading, 1))
+            + " ht="
+            + str(round(heading_to_target, 1))
+            + " ef="
+            + str(round(front_error, 1))
+            + " eb="
+            + str(round(back_error, 1))
+            + " ep="
+            + str(round(phase_error, 1))
+            + " dir="
+            + ("F" if self._target_drive_sign > 0 else "R")
+            + " cmd=("
+            + str(round(self._last_left_command, 1))
+            + ","
+            + str(round(self._last_right_command, 1))
+            + ")"
+        )
+
     def _clamp_speed(self, value):
         return max(-100, min(100, value))
 
@@ -1599,10 +1878,162 @@ class AutonomousController:
 
     def _mix_robot_drive(self, linear, turn):
         """Convert robot-relative linear/turn into motor commands."""
+        # Use drivetrain's canonical mixer so autonomous and teleop share the
+        # exact same sign and hardware inversion behavior.
+        if hasattr(self.drivecontroller, "mix_robot_command"):
+            return self.drivecontroller.mix_robot_command(linear, turn, apply_front_flip=False)
+
+        # Fallback path if drivetrain helper is unavailable.
         left = linear + turn
         right = linear - turn
-        right *= self._right_motor_sign
         return self._clamp_speed(left), self._clamp_speed(right)
+
+    def _simple_get_heading_deg(self):
+        """Heading source for simple turning: prefer GPS gyro heading."""
+        try:
+            if self.pose_filter is not None and getattr(self.pose_filter, "gps", None) is not None:
+                return self._wrap_heading(self.pose_filter.gps.get_heading())
+        except Exception:
+            pass
+        try:
+            if self.pose_filter is not None:
+                pose = self.pose_filter.get_estimate()
+                if pose is not None:
+                    return self._wrap_heading(pose.z)
+        except Exception:
+            pass
+        return 0.0
+
+    def _simple_spin_to_positions(self, left_target_deg, right_target_deg, max_speed_pct, timeout_s=3.5):
+        """Move average left/right drive encoder positions to absolute targets."""
+        timer = Timer()
+        timer.reset()
+        kp = 0.14
+        min_cmd = 8.0
+        max_speed_pct = max(5.0, min(100.0, max_speed_pct))
+
+        while timer.time(vex.TimeUnits.SECONDS) < timeout_s:
+            left_now, right_now = self.drivecontroller.get_drive_positions_degrees()
+            left_err = left_target_deg - left_now
+            right_err = right_target_deg - right_now
+
+            if abs(left_err) <= 6.0 and abs(right_err) <= 6.0:
+                break
+
+            left_cmd = max(-max_speed_pct, min(max_speed_pct, kp * left_err))
+            right_cmd = max(-max_speed_pct, min(max_speed_pct, kp * right_err))
+
+            if abs(left_cmd) < min_cmd and abs(left_err) > 6.0:
+                left_cmd = min_cmd if left_err > 0 else -min_cmd
+            if abs(right_cmd) < min_cmd and abs(right_err) > 6.0:
+                right_cmd = min_cmd if right_err > 0 else -min_cmd
+
+            # Convert normalized right-wheel command into motor command space
+            # when the right side is physically mounted backward.
+            right_motor_cmd = right_cmd
+            try:
+                if hasattr(self.drivecontroller, "right_side_sign"):
+                    right_motor_cmd = right_cmd * float(self.drivecontroller.right_side_sign)
+            except Exception:
+                right_motor_cmd = right_cmd
+
+            self.drivecontroller.update_manually(left_cmd, right_motor_cmd)
+            self.drivecontroller.update_motor_speeds()
+            vex.sleep(10)
+
+        self.drivecontroller.update_manually(0.0, 0.0)
+        self.drivecontroller.update_motor_speeds()
+
+    def _simple_turn_by(self, delta_heading_deg, desired_heading=None):
+        """Open-loop wheel-turn by angle, then optional gyro-only trim."""
+        if abs(delta_heading_deg) <= self._simple_turn_tolerance_deg:
+            return
+
+        wheel_d_mm, track_w_mm, gear_ratio = self.drivecontroller.get_odometry_constants()
+        wheel_c_mm = wheel_d_mm * math.pi
+        turn_arc_mm = (math.pi * track_w_mm * abs(delta_heading_deg)) / 360.0
+        motor_deg = (turn_arc_mm / wheel_c_mm) * (360.0 / gear_ratio)
+
+        left_now, right_now = self.drivecontroller.get_drive_positions_degrees()
+        # Field heading is clockwise-positive.
+        if delta_heading_deg > 0:
+            left_target = left_now + motor_deg
+            right_target = right_now - motor_deg
+        else:
+            left_target = left_now - motor_deg
+            right_target = right_now + motor_deg
+
+        self._simple_spin_to_positions(left_target, right_target, self._simple_turn_speed_pct)
+
+        # Gyro-only fine trim (single short correction pass).
+        heading_now = self._simple_get_heading_deg()
+        if desired_heading is None:
+            desired_heading = self._wrap_heading(heading_now + delta_heading_deg)
+        trim_error = self._angle_residual(desired_heading, heading_now)
+        if abs(trim_error) > self._simple_turn_tolerance_deg:
+            timer = Timer()
+            timer.reset()
+            while timer.time(vex.TimeUnits.SECONDS) < 0.8:
+                h = self._simple_get_heading_deg()
+                err = self._angle_residual(desired_heading, h)
+                if abs(err) <= self._simple_turn_tolerance_deg:
+                    break
+                turn_cmd = max(-18.0, min(18.0, err * 0.45))
+                left_cmd, right_cmd = self._mix_robot_drive(0.0, turn_cmd)
+                self.drivecontroller.update_manually(left_cmd, right_cmd)
+                self.drivecontroller.update_motor_speeds()
+                vex.sleep(10)
+            self.drivecontroller.update_manually(0.0, 0.0)
+            self.drivecontroller.update_motor_speeds()
+
+    def _simple_drive_by(self, distance_mm):
+        if abs(distance_mm) < 5.0:
+            return
+        wheel_d_mm, _, gear_ratio = self.drivecontroller.get_odometry_constants()
+        wheel_c_mm = wheel_d_mm * math.pi
+        motor_deg = (distance_mm / wheel_c_mm) * (360.0 / gear_ratio)
+
+        left_now, right_now = self.drivecontroller.get_drive_positions_degrees()
+        left_target = left_now + motor_deg
+        right_target = right_now + motor_deg
+        self._simple_spin_to_positions(left_target, right_target, self._simple_drive_speed_pct, timeout_s=4.5)
+
+    def _run_simple_target_once(self):
+        if self.pose_filter is None:
+            self.logger.error("Simple target mode needs pose filter")
+            self._mark_target_complete()
+            return
+        pose = self.pose_filter.get_estimate()
+        if pose is None or self.target_world is None:
+            return
+
+        start_x = pose.x
+        start_y = pose.y
+        start_h = self._simple_get_heading_deg()
+        tx, ty = self.target_world
+        dx = tx - start_x
+        dy = ty - start_y
+        distance_mm = math.sqrt((dx * dx) + (dy * dy))
+        heading_to_target = start_h if distance_mm <= 1e-6 else self._heading_from_target_vector(dx, dy)
+
+        turn_1 = self._angle_residual(heading_to_target, start_h)
+        self.logger.log(
+            "SIMPLE t1="
+            + str(round(turn_1, 1))
+            + " d="
+            + str(int(distance_mm))
+        )
+        self._simple_turn_by(turn_1, desired_heading=heading_to_target)
+
+        self._simple_drive_by(distance_mm)
+
+        if self.target_angle is not None:
+            h_now = self._simple_get_heading_deg()
+            turn_2 = self._angle_residual(self.target_angle, h_now)
+            self.logger.log("SIMPLE t2=" + str(round(turn_2, 1)))
+            self._simple_turn_by(turn_2, desired_heading=self.target_angle)
+
+        self._mark_target_complete()
 
     def _profile_speed(self, traveled, remaining, accel, max_speed, min_speed, hold_min=True):
         """Kinematic trapezoid/triangle speed profile.
@@ -1624,6 +2055,79 @@ class AutonomousController:
             magnitude = min_speed
         return max(0.0, min(max_speed, magnitude))
 
+    def _turn_profile_from_error(self, start_error_deg, current_error_deg, min_speed, max_speed):
+        """Turn speed profile based on angle error (deg), not pseudo-kinematics.
+
+        Produces:
+        - accel region near start,
+        - optional cruise at max speed,
+        - decel region near target.
+        """
+        start_error = max(start_error_deg, 1e-6)
+        remaining = max(0.0, current_error_deg)
+        traveled = max(0.0, start_error - remaining)
+        # Expand ramp with total turn size so long turns do not stay at max too
+        # long; this gives visible deceleration well before target.
+        ramp = max(1.0, max(self._target_turn_ramp_deg, start_error * 0.45))
+
+        if start_error <= (2.0 * ramp):
+            # Triangle profile for short turns.
+            half = start_error * 0.5
+            if half <= 1e-6:
+                factor = 0.0
+            elif traveled <= half:
+                factor = traveled / half
+            else:
+                factor = remaining / half
+        else:
+            # Trapezoid profile for longer turns.
+            if traveled < ramp:
+                factor = traveled / ramp
+            elif remaining < ramp:
+                factor = remaining / ramp
+            else:
+                factor = 1.0
+
+        factor = max(0.0, min(1.0, factor))
+        return min_speed + ((max_speed - min_speed) * factor)
+
+    def _turn_speed_from_error(self, abs_error_deg, tolerance_deg):
+        """Monotonic turn speed: larger error => faster, near target => slower."""
+        if abs_error_deg <= tolerance_deg:
+            return 0.0
+        span = max(1e-6, self._target_turn_full_error_deg - tolerance_deg)
+        ratio = (abs_error_deg - tolerance_deg) / span
+        ratio = max(0.0, min(1.0, ratio))
+        return self._target_min_turn_speed + ((self._target_max_turn_speed - self._target_min_turn_speed) * ratio)
+
+    def _target_maybe_autofix_turn_sign(self, heading_error):
+        """Flip autonomous turn sign if turn commands repeatedly increase error."""
+        if not self._target_auto_turn_sign_enabled:
+            return
+        prev_error = self._target_prev_phase_heading_error_deg
+        self._target_prev_phase_heading_error_deg = heading_error
+
+        if prev_error is None:
+            return
+
+        if abs(self._target_last_turn_cmd) < (self._target_min_turn_speed * 0.7):
+            self._target_turn_bad_streak = 0
+            return
+
+        # If absolute error grows despite a meaningful turn command, polarity may be wrong.
+        if abs(heading_error) > (abs(prev_error) + self._target_turn_error_increase_deg):
+            self._target_turn_bad_streak += 1
+        else:
+            self._target_turn_bad_streak = 0
+
+        if self._target_turn_bad_streak >= self._target_turn_flip_streak_required:
+            self._target_turn_sign *= -1.0
+            self._target_turn_bad_streak = 0
+            self.logger.warn(
+                "Target turn polarity auto-flipped; new sign="
+                + str(int(self._target_turn_sign))
+            )
+
     def _signed_from_error(self, error, magnitude):
         if error > 0:
             return magnitude
@@ -1637,16 +2141,59 @@ class AutonomousController:
             self._target_drive_sign = self._choose_drive_sign(current_heading, heading_to_target)
             self._target_choose_direction_on_align = False
         self._target_in_tolerance_count = 0
-        heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+        if self._target_drive_sign < 0:
+            self._target_align_goal_heading_deg = self._wrap_heading(heading_to_target + 180.0)
+        else:
+            self._target_align_goal_heading_deg = heading_to_target
+        heading_error = self._angle_residual(self._target_align_goal_heading_deg, current_heading)
         self._target_align_start_error_deg = max(abs(heading_error), self._target_align_tolerance_deg)
         self._target_phase_entry_heading_error_deg = heading_error
+        self._target_prev_phase_heading_error_deg = None
+        self._target_last_turn_cmd = 0.0
+        self._target_turn_bad_streak = 0
         self._final_heading_pid.reset()
+        self.logger.log(
+            "Target phase -> align (err="
+            + str(round(heading_error, 1))
+            + " deg, goal="
+            + str(round(self._target_align_goal_heading_deg, 1))
+            + " deg, drive="
+            + ("forward" if self._target_drive_sign > 0 else "reverse")
+            + ")"
+        )
 
-    def _enter_drive_phase(self, distance_mm):
+    def _enter_drive_phase(self, pose_x, pose_y, target_x, target_y, heading_to_target, distance_mm):
         self._target_phase = "drive"
         self._target_in_tolerance_count = 0
         self._target_drive_start_distance_mm = max(distance_mm, self.target_tolerance_mm)
+        self._target_drive_start_x_mm = pose_x
+        self._target_drive_start_y_mm = pose_y
+        self._target_drive_path_length_mm = max(distance_mm, self.target_tolerance_mm)
+        if distance_mm > 1e-6:
+            self._target_drive_unit_x = (target_x - pose_x) / distance_mm
+            self._target_drive_unit_y = (target_y - pose_y) / distance_mm
+        else:
+            self._target_drive_unit_x = 0.0
+            self._target_drive_unit_y = 0.0
+        if self._target_drive_sign < 0:
+            self._target_drive_heading_locked_deg = self._wrap_heading(heading_to_target + 180.0)
+        else:
+            self._target_drive_heading_locked_deg = heading_to_target
+        self._target_prev_phase_heading_error_deg = None
+        self._target_last_turn_cmd = 0.0
+        self._target_turn_bad_streak = 0
         self._path_heading_pid.reset()
+        self._target_drive_best_distance_mm = distance_mm
+        self._target_drive_regress_streak = 0
+        self.logger.log(
+            "Target phase -> drive (dist="
+            + str(int(distance_mm))
+            + " mm, drive="
+            + ("forward" if self._target_drive_sign > 0 else "reverse")
+            + ", hlock="
+            + str(round(self._target_drive_heading_locked_deg, 1))
+            + ")"
+        )
 
     def _enter_final_turn_phase(self, current_heading):
         self._target_phase = "final_turn"
@@ -1654,7 +2201,18 @@ class AutonomousController:
         heading_error = self._angle_residual(self.target_angle, current_heading)
         self._target_final_turn_start_error_deg = max(abs(heading_error), self.target_heading_tolerance_deg)
         self._target_phase_entry_heading_error_deg = heading_error
+        self._target_prev_phase_heading_error_deg = None
+        self._target_last_turn_cmd = 0.0
+        self._target_turn_bad_streak = 0
         self._final_heading_pid.reset()
+        target_angle = self.target_angle if self.target_angle is not None else 0.0
+        self.logger.log(
+            "Target phase -> final_turn (err="
+            + str(round(heading_error, 1))
+            + " deg, target="
+            + str(round(target_angle, 1))
+            + " deg)"
+        )
 
     def _choose_drive_sign(self, current_heading, heading_to_target):
         front_error = self._angle_residual(heading_to_target, current_heading)
@@ -1679,6 +2237,36 @@ class AutonomousController:
         self._last_left_command = 0.0
         self._last_right_command = 0.0
         self.drivecontroller.update_manually(0, 0)
+        self.logger.log("Target phase -> done")
+
+        if len(self._target_queue) > 0:
+            next_target = self._target_queue.pop(0)
+            self.set_target(next_target[0], next_target[1], next_target[2])
+
+    def clear_target_queue(self):
+        self._target_queue = []
+
+    def queue_target(self, x_mm, y_mm, target_angle=None):
+        self._target_queue.append((x_mm, y_mm, target_angle))
+
+    def set_target_sequence(self, targets):
+        """Set and execute a sequence of targets.
+
+        `targets` is an iterable of (x, y) or (x, y, heading).
+        """
+        self._target_queue = []
+        parsed = []
+        for t in targets:
+            if len(t) >= 3:
+                parsed.append((t[0], t[1], t[2]))
+            else:
+                parsed.append((t[0], t[1], None))
+        if len(parsed) == 0:
+            return
+        first = parsed[0]
+        for t in parsed[1:]:
+            self._target_queue.append(t)
+        self.set_target(first[0], first[1], first[2])
 
     def set_target(self, x_mm, y_mm, target_angle=None):
         """Set movement target using quadrant-4 coordinates, mirrored to startup quadrant."""
@@ -1691,19 +2279,36 @@ class AutonomousController:
         self.target_active = True
         self._target_phase = "align"
         self._target_in_tolerance_count = 0
+        self._target_arrival_in_tolerance_count = 0
         self._target_drive_sign = 1.0
         self._target_choose_direction_on_align = True
         self._target_align_start_error_deg = 0.0
+        self._target_align_goal_heading_deg = None
         self._target_drive_start_distance_mm = 0.0
         self._target_final_turn_start_error_deg = 0.0
         self._target_phase_entry_heading_error_deg = 0.0
-
         self._distance_pid.reset()
         self._path_heading_pid.reset()
         self._final_heading_pid.reset()
 
         self._target_timer.reset()
         self._target_last_time_s = self._target_timer.time(vex.TimeUnits.SECONDS)
+        self._target_debug_last_log_s = -999.0
+        self._target_prev_phase_heading_error_deg = None
+        self._target_last_turn_cmd = 0.0
+        self._target_turn_bad_streak = 0
+        self._target_last_distance_mm = None
+        self._target_drive_away_streak = 0
+        self._target_drive_start_x_mm = 0.0
+        self._target_drive_start_y_mm = 0.0
+        self._target_drive_unit_x = 0.0
+        self._target_drive_unit_y = 0.0
+        self._target_drive_path_length_mm = 0.0
+        self._target_drive_heading_locked_deg = 0.0
+        self._target_drive_best_distance_mm = 0.0
+        self._target_drive_regress_streak = 0
+        self._target_last_pose_x_mm = None
+        self._target_last_pose_y_mm = None
         self._last_left_command = 0.0
         self._last_right_command = 0.0
 
@@ -1728,6 +2333,9 @@ class AutonomousController:
         """
         if not self.target_active or self.target_world is None:
             return
+        if self._simple_nav_enabled:
+            self._run_simple_target_once()
+            return
         if self.pose_filter is None:
             self.logger.error("Target mode needs pose filter")
             self.target_active = False
@@ -1736,6 +2344,18 @@ class AutonomousController:
         pose = self.pose_filter.get_estimate()
         if pose is None:
             return
+
+        # Reject implausible single-frame pose jumps (GPS/filter outliers)
+        # that can destabilize phase transitions and heading control.
+        if self._target_last_pose_x_mm is not None and self._target_last_pose_y_mm is not None:
+            jump_dx = pose.x - self._target_last_pose_x_mm
+            jump_dy = pose.y - self._target_last_pose_y_mm
+            jump_mm = math.sqrt((jump_dx * jump_dx) + (jump_dy * jump_dy))
+            if jump_mm > self._target_pose_jump_max_mm:
+                self._command_drive_smoothed(0.0, 0.0)
+                return
+        self._target_last_pose_x_mm = pose.x
+        self._target_last_pose_y_mm = pose.y
 
         dt = self._target_dt()
         target_x, target_y = self.target_world
@@ -1749,38 +2369,159 @@ class AutonomousController:
         else:
             heading_to_target = current_heading
 
-        if self._target_phase == "align":
+        self._target_debug_log(
+            self._target_phase,
+            distance_mm,
+            current_heading,
+            heading_to_target,
+            pose.x,
+            pose.y,
+            target_x,
+            target_y,
+        )
+
+        # Arrival handling (all phases) when no final heading is required.
+        # This prevents oscillating between align/drive near target due GPS jitter.
+        if self.target_angle is None:
+            arrival_required = max(1, int(self._target_arrival_required_no_heading))
+            if distance_mm <= self.target_tolerance_mm:
+                self._target_arrival_in_tolerance_count += 1
+            elif (
+                self._target_arrival_in_tolerance_count > 0
+                and distance_mm <= (self.target_tolerance_mm + self._target_arrival_hysteresis_mm)
+            ):
+                pass
+            else:
+                self._target_arrival_in_tolerance_count = 0
+
+            if self._target_arrival_in_tolerance_count >= arrival_required:
+                self._command_drive_smoothed(0, 0)
+                self._mark_target_complete()
+                return
+
+        if self._target_phase == "align" and self._target_align_start_error_deg <= 0.0:
             self._enter_align_phase(current_heading, heading_to_target)
 
         if self._target_phase == "align":
-            heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+            if self._target_align_goal_heading_deg is None:
+                self._enter_align_phase(current_heading, heading_to_target)
+                return
+            heading_error = self._angle_residual(self._target_align_goal_heading_deg, current_heading)
             abs_error = abs(heading_error)
+            live_heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+            abs_live_error = abs(live_heading_error)
 
-            if abs_error <= self._target_align_tolerance_deg:
+            # If we entered align while holding a stale drive direction and the
+            # opposite direction is clearly better, switch once and continue.
+            opposite_drive_sign = -1.0 if self._target_drive_sign > 0 else 1.0
+            opposite_live_error = self._heading_error_for_drive_sign(
+                current_heading,
+                heading_to_target,
+                opposite_drive_sign,
+            )
+            if (
+                abs_live_error > 95.0
+                and abs(opposite_live_error) < (abs_live_error - 28.0)
+            ):
+                self._target_drive_sign = opposite_drive_sign
+                self._target_align_goal_heading_deg = (
+                    self._wrap_heading(heading_to_target + 180.0)
+                    if self._target_drive_sign < 0
+                    else heading_to_target
+                )
+                heading_error = self._angle_residual(self._target_align_goal_heading_deg, current_heading)
+                abs_error = abs(heading_error)
+                live_heading_error = self._heading_error_for_drive_sign(
+                    current_heading,
+                    heading_to_target,
+                    self._target_drive_sign,
+                )
+                abs_live_error = abs(live_heading_error)
+                self._target_prev_phase_heading_error_deg = None
+                self._target_last_turn_cmd = 0.0
+                self._target_turn_bad_streak = 0
+                self.logger.log(
+                    "Align: switching drive direction to "
+                    + ("forward" if self._target_drive_sign > 0 else "reverse")
+                )
+
+            if self._target_drive_sign < 0:
+                live_align_goal_heading = self._wrap_heading(heading_to_target + 180.0)
+            else:
+                live_align_goal_heading = heading_to_target
+            goal_drift_error = abs(self._angle_residual(live_align_goal_heading, self._target_align_goal_heading_deg))
+
+            # If the live target bearing diverges a lot from the frozen align goal,
+            # refresh align goal to current geometry.
+            if goal_drift_error > self._target_align_goal_refresh_threshold_deg:
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0.0, 0.0)
+                return
+
+            if (
+                abs_error <= self._target_align_settle_tolerance_deg
+                and abs_live_error <= self._target_align_live_tolerance_deg
+            ):
                 self._target_in_tolerance_count += 1
+                # Hold still while collecting settle frames; this prevents
+                # minimum-turn command from kicking the robot back out of band.
+                self._target_last_turn_cmd = 0.0
+                self._command_drive_smoothed(0.0, 0.0)
             else:
                 self._target_in_tolerance_count = 0
 
             if self._target_in_tolerance_count >= self._target_settle_frames:
-                self._enter_drive_phase(distance_mm)
+                self._enter_drive_phase(
+                    pose.x,
+                    pose.y,
+                    target_x,
+                    target_y,
+                    heading_to_target,
+                    distance_mm,
+                )
                 self._command_drive_smoothed(0.0, 0.0)
                 return
 
-            turned = max(0.0, self._target_align_start_error_deg - abs_error)
-            turn_mag = self._profile_speed(
-                traveled=turned,
-                remaining=abs_error,
-                accel=self._target_turn_accel,
-                max_speed=self._target_max_turn_speed,
-                min_speed=self._target_min_turn_speed,
-                hold_min=True,
-            )
+            if (
+                abs_error <= self._target_align_settle_tolerance_deg
+                and abs_live_error <= self._target_align_live_tolerance_deg
+            ):
+                return
+
+            if (
+                abs_error <= self._target_align_settle_tolerance_deg
+                and abs_live_error > self._target_align_live_tolerance_deg
+            ):
+                # Frozen goal is "done" but live geometry drifted; refresh.
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0.0, 0.0)
+                return
+
+            self._target_maybe_autofix_turn_sign(heading_error)
+
+            turn_mag = self._turn_speed_from_error(abs_error, self._target_align_settle_tolerance_deg)
             turn_cmd = self._signed_from_error(heading_error, turn_mag)
+            self._target_last_turn_cmd = turn_cmd
             left_cmd, right_cmd = self._mix_robot_drive(0.0, turn_cmd)
             self._command_drive_smoothed(left_cmd, right_cmd)
             return
 
         if self._target_phase == "drive":
+            if self._target_last_distance_mm is not None:
+                if distance_mm > (self._target_last_distance_mm + self._target_drive_away_delta_mm):
+                    self._target_drive_away_streak += 1
+                else:
+                    self._target_drive_away_streak = 0
+            self._target_last_distance_mm = distance_mm
+
+            if self._target_auto_drive_sign_flip_enabled and self._target_drive_away_streak >= self._target_drive_away_streak_required:
+                self._target_drive_away_streak = 0
+                self._target_drive_sign *= -1.0
+                self.logger.warn("Drive phase diverging: flipping drive direction and re-aligning")
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0, 0)
+                return
+
             if distance_mm <= self.target_tolerance_mm:
                 self._target_in_tolerance_count += 1
             else:
@@ -1794,28 +2535,130 @@ class AutonomousController:
                     self._enter_final_turn_phase(current_heading)
                 return
 
-            heading_error = self._heading_error_for_drive_sign(current_heading, heading_to_target, self._target_drive_sign)
+            dx_from_start = pose.x - self._target_drive_start_x_mm
+            dy_from_start = pose.y - self._target_drive_start_y_mm
+            progress_mm = (dx_from_start * self._target_drive_unit_x) + (dy_from_start * self._target_drive_unit_y)
+            remaining_along_mm = self._target_drive_path_length_mm - progress_mm
+            if remaining_along_mm < 0.0:
+                remaining_along_mm = 0.0
 
-            if abs(heading_error) > self._target_realign_threshold_deg:
-                # Keep current direction unless a full re-choose is requested.
-                self._target_choose_direction_on_align = False
+            # Progress sanity check: if we are moving opposite the frozen path
+            # direction by a meaningful amount, force a fresh align + F/R choice.
+            reverse_progress_threshold = max(120.0, self._target_drive_path_length_mm * 0.18)
+            if progress_mm < -reverse_progress_threshold:
+                self.logger.warn("Drive path progress reversed; replanning")
+                self._target_choose_direction_on_align = True
                 self._enter_align_phase(current_heading, heading_to_target)
                 self._command_drive_smoothed(0, 0)
                 return
 
-            traveled = max(0.0, self._target_drive_start_distance_mm - distance_mm)
+            # Distance-regression guard: if we keep getting farther than the
+            # best distance achieved in this drive segment, replan.
+            if self._target_drive_best_distance_mm <= 0.0:
+                self._target_drive_best_distance_mm = distance_mm
+            if distance_mm < (self._target_drive_best_distance_mm - 5.0):
+                self._target_drive_best_distance_mm = distance_mm
+                self._target_drive_regress_streak = 0
+            elif distance_mm > (self._target_drive_best_distance_mm + self._target_drive_regress_delta_mm):
+                self._target_drive_regress_streak += 1
+            else:
+                if self._target_drive_regress_streak > 0:
+                    self._target_drive_regress_streak -= 1
+
+            if self._target_drive_regress_streak >= self._target_drive_regress_streak_required:
+                self.logger.warn("Drive distance regression detected; replanning")
+                self._target_choose_direction_on_align = True
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0, 0)
+                return
+
+            # Cross-track error from the frozen path segment.
+            cross_track_mm = abs(
+                (dx_from_start * self._target_drive_unit_y)
+                - (dy_from_start * self._target_drive_unit_x)
+            )
+
+            # If we reached/passed the segment endpoint but are still far from
+            # target, the frozen segment assumptions broke (pose drift or path
+            # miss). Re-plan from current pose.
+            if (
+                remaining_along_mm <= self.target_tolerance_mm
+                and distance_mm > (self.target_tolerance_mm * 3.0)
+            ):
+                self.logger.warn(
+                    "Drive miss detected: replanning (d="
+                    + str(int(distance_mm))
+                    + " ct="
+                    + str(int(cross_track_mm))
+                    + ")"
+                )
+                self._target_choose_direction_on_align = True
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0, 0)
+                return
+
+            # If current drive direction no longer matches live geometry
+            # (e.g., we crossed to the other side of target), re-choose F/R.
+            live_heading_error = self._heading_error_for_drive_sign(
+                current_heading,
+                heading_to_target,
+                self._target_drive_sign,
+            )
+            live_realign_threshold = self._target_live_realign_error_deg_far
+            if distance_mm <= self._target_live_realign_close_distance_mm:
+                live_realign_threshold = self._target_live_realign_error_deg_close
+            if abs(live_heading_error) > live_realign_threshold and distance_mm > (self.target_tolerance_mm * 1.4):
+                self.logger.warn(
+                    "Drive direction invalid for live target; re-aligning"
+                )
+                self._target_choose_direction_on_align = True
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0, 0)
+                return
+
+            heading_error = self._angle_residual(self._target_drive_heading_locked_deg, current_heading)
+
+            realign_threshold = self._target_realign_threshold_deg
+            if distance_mm <= self._target_realign_close_distance_mm:
+                realign_threshold += self._target_realign_close_boost_deg
+
+            if abs(heading_error) > realign_threshold:
+                # Near target, allow fresh direction selection to avoid
+                # long-wrap spins after overshoot/crossing.
+                if distance_mm <= self._target_realign_close_distance_mm:
+                    self._target_choose_direction_on_align = True
+                else:
+                    self._target_choose_direction_on_align = False
+                self._enter_align_phase(current_heading, heading_to_target)
+                self._command_drive_smoothed(0, 0)
+                return
+
+            traveled = max(0.0, progress_mm)
             drive_mag = self._profile_speed(
                 traveled=traveled,
-                remaining=distance_mm,
+                remaining=remaining_along_mm,
                 accel=self._target_drive_accel,
                 max_speed=self._target_max_drive_speed,
                 min_speed=self._target_min_drive_speed,
-                hold_min=(distance_mm > self.target_tolerance_mm),
+                hold_min=(remaining_along_mm > self.target_tolerance_mm),
             )
 
+            # Soften approach velocity near target to reduce fly-through and
+            # repeated re-align loops when GPS updates are sparse.
+            if distance_mm <= self._target_approach_slow_distance_mm:
+                approach_cap = max(
+                    self._target_min_drive_speed,
+                    distance_mm * self._target_approach_speed_per_mm,
+                )
+                drive_mag = min(drive_mag, approach_cap)
+
             self._path_heading_pid.setpoint = 0
-            steering = self._path_heading_pid.compute(-heading_error, dt=dt)
-            steer_cap = min(self._target_max_steer_speed, max(6.0, drive_mag * 0.4))
+            heading_correction_error = heading_error
+            if distance_mm <= self._target_live_realign_close_distance_mm:
+                heading_correction_error = (heading_error * 0.35) + (live_heading_error * 0.65)
+            steering = self._path_heading_pid.compute(-heading_correction_error, dt=dt)
+            steer_min = 6.0 if distance_mm <= self._target_live_realign_close_distance_mm else 4.0
+            steer_cap = min(self._target_max_steer_speed, max(steer_min, drive_mag * 0.24))
             steering = max(-steer_cap, min(steer_cap, steering))
 
             linear = self._target_drive_sign * drive_mag
@@ -1833,6 +2676,8 @@ class AutonomousController:
 
             if abs_error <= self.target_heading_tolerance_deg:
                 self._target_in_tolerance_count += 1
+                self._target_last_turn_cmd = 0.0
+                self._command_drive_smoothed(0.0, 0.0)
             else:
                 self._target_in_tolerance_count = 0
 
@@ -1840,25 +2685,29 @@ class AutonomousController:
                 self._mark_target_complete()
                 return
 
-            turned = max(0.0, self._target_final_turn_start_error_deg - abs_error)
-            turn_mag = self._profile_speed(
-                traveled=turned,
-                remaining=abs_error,
-                accel=self._target_turn_accel,
-                max_speed=self._target_max_turn_speed,
-                min_speed=self._target_min_turn_speed,
-                hold_min=True,
-            )
+            if abs_error <= self.target_heading_tolerance_deg:
+                return
+
+            self._target_maybe_autofix_turn_sign(heading_error)
+
+            turn_mag = self._turn_speed_from_error(abs_error, self.target_heading_tolerance_deg)
             turn_cmd = self._signed_from_error(heading_error, turn_mag)
+            self._target_last_turn_cmd = turn_cmd
             left_cmd, right_cmd = self._mix_robot_drive(0.0, turn_cmd)
             self._command_drive_smoothed(left_cmd, right_cmd)
             return
+
+    def update_target(self):
+        """Compatibility wrapper used by the step system."""
+        self.target_update()
 
     def _stop_all_outputs(self):
         self.drivecontroller.update_manually(0, 0)
         self.intake.update_manually(0)
         self.outtake.update_manually(0)
         self.matchloader.update_manually(0)
+        if self.descore is not None:
+            self.descore.update_manually(0)
 
     def is_finished(self):
         return self.currentstepidx >= len(self.steps)
@@ -1866,16 +2715,136 @@ class AutonomousController:
     def start(self):
         self.timer.reset()
         self.currentstepidx = 0
-        if self.steps:
-            self.completesteptime = self.steps[0].duration
+        self._active_step_index = -1
+        self._active_step_same_position = False
+        self._active_step_delay_until_s = None
+        self._active_step_started = False
+        self._step_heading_in_tolerance_count = 0
+        self._last_step_x = None
+        self._last_step_y = None
+        self._last_step_heading = None
+        self._last_step_intake = 0
+        self._last_step_outtake = 0
+        self._last_step_match = None
+        self._last_step_descore = None
+        self._last_step_delay = 0.0
+        # Clear prior target run state when using step playback.
+        self.clear_target_queue()
+        self.target_q4 = None
+        self.target_world = None
+        self.target_active = False
+        self.arrived_at_target = False
+        self.completesteptime = 0
+
+    def _begin_step(self, idx, step):
+        self._active_step_index = idx
+        self._active_step_started = True
+        self._active_step_delay_until_s = None
+        self._step_heading_in_tolerance_count = 0
+
+        target_x = self._last_step_x if step.x is None else step.x
+        target_y = self._last_step_y if step.y is None else step.y
+        target_heading = self._last_step_heading if step.heading is None else step.heading
+        intake_cmd = self._last_step_intake if step.intake is None else step.intake
+        outtake_cmd = self._last_step_outtake if step.outtake is None else step.outtake
+        match_state = self._last_step_match if step.match is None else step.match
+        descore_state = self._last_step_descore if step.descore is None else step.descore
+        delay_s = self._last_step_delay if step.delay is None else step.delay
+
+        self._resolved_step_x = target_x
+        self._resolved_step_y = target_y
+        self._resolved_step_heading = target_heading
+        self._resolved_step_intake = intake_cmd
+        self._resolved_step_outtake = outtake_cmd
+        self._resolved_step_match = match_state
+        self._resolved_step_descore = descore_state
+        self._resolved_step_delay = 0.0 if delay_s is None else delay_s
+
+        same_position = (
+            self._last_step_x is not None
+            and self._last_step_y is not None
+            and target_x == self._last_step_x
+            and target_y == self._last_step_y
+        )
+        self._active_step_same_position = same_position
+
+        if target_x is None or target_y is None:
+            # No movement target for this step, but still allow heading-only
+            # behavior (rotate in place) when a heading is provided.
+            self._active_step_same_position = True
+            self.target_active = False
+            self.arrived_at_target = True
+        elif not same_position:
+            self.set_target(target_x, target_y, target_heading)
         else:
-            self.completesteptime = 0
+            # Same x/y as previous step: do not set a movement target.
+            self.target_active = False
+            self.arrived_at_target = True
+
+    def _heading_only_settled(self, target_heading):
+        if self.pose_filter is None:
+            return True
+        pose = self.pose_filter.get_estimate()
+        if pose is None:
+            return False
+
+        current_heading = self._wrap_heading(pose.z)
+        heading_error = self._angle_residual(target_heading, current_heading)
+        abs_error = abs(heading_error)
+
+        if abs_error <= self.target_heading_tolerance_deg:
+            self._step_heading_in_tolerance_count += 1
+            self._command_drive_smoothed(0.0, 0.0)
+            return self._step_heading_in_tolerance_count >= self._target_settle_frames
+
+        self._step_heading_in_tolerance_count = 0
+        turn_mag = self._turn_speed_from_error(abs_error, self.target_heading_tolerance_deg)
+        turn_cmd = self._signed_from_error(heading_error, turn_mag)
+        left_cmd, right_cmd = self._mix_robot_drive(0.0, turn_cmd)
+        self._command_drive_smoothed(left_cmd, right_cmd)
+        return False
+
+    def _advance_step(self):
+        self._last_step_x = self._resolved_step_x
+        self._last_step_y = self._resolved_step_y
+        self._last_step_heading = self._resolved_step_heading
+        self._last_step_intake = self._resolved_step_intake
+        self._last_step_outtake = self._resolved_step_outtake
+        self._last_step_match = self._resolved_step_match
+        self._last_step_descore = self._resolved_step_descore
+        self._last_step_delay = self._resolved_step_delay
+        self.currentstepidx += 1
+        self._active_step_started = False
+        self._active_step_index = -1
+        self._active_step_same_position = False
+        self._active_step_delay_until_s = None
+        self._step_heading_in_tolerance_count = 0
+
+    def _finish_step_delay_if_needed(self):
+        delay_s = self._resolved_step_delay
+        if delay_s <= 0.0:
+            self._advance_step()
+            return
+        now_s = self.timer.time(vex.TimeUnits.SECONDS)
+        if self._active_step_delay_until_s is None:
+            self._active_step_delay_until_s = now_s + delay_s
+            self._command_drive_smoothed(0.0, 0.0)
+            return
+        if now_s >= self._active_step_delay_until_s:
+            self._advance_step()
+            return
+        self._command_drive_smoothed(0.0, 0.0)
 
     def update(self):
-        if self.target_active:
-            self.target_update()
-        else:
+        if self.currentstepidx < len(self.steps):
             self._update_steps()
+        elif self.target_active:
+            self.update_target()
+        elif self._simple_nav_enabled and self.arrived_at_target and self.target_q4 is not None:
+            # In simple target mode, do not fall through into step autonomous.
+            self._stop_all_outputs()
+        else:
+            self._stop_all_outputs()
     
     def _update_steps(self):
         """Run the active step-based autonomous routine."""
@@ -1884,28 +2853,41 @@ class AutonomousController:
             self._stop_all_outputs()
             return
 
-        # VEX Timer.time defaults to milliseconds, so ask for seconds to match
-        # the step durations we store.
-        if self.timer.time(vex.TimeUnits.SECONDS) >= self.completesteptime:
-            self.completesteptime += self.steps[self.currentstepidx].duration
-            self.currentstepidx += 1
-
-            if self.currentstepidx >= len(self.steps):
-                # finished
-                self._stop_all_outputs()
-                return
-
         step = self.steps[self.currentstepidx]
-        self.drivecontroller.update_manually(step.left, step.right)
-        self.intake.update_manually(step.intake_speed)
-        self.outtake.update_manually(step.outtake_speed)
-        if step.matchloader_toggle_state is not None and getattr(self.matchloader, "mode", None) == "toggle":
-            try:
-                self.matchloader.set_toggle_state(step.matchloader_toggle_state)
-            except RuntimeError:
-                self.matchloader.update_manually(step.matchloader_speed)
+
+        if not self._active_step_started or self._active_step_index != self.currentstepidx:
+            self._begin_step(self.currentstepidx, step)
+
+        self.intake.update_manually(self._resolved_step_intake)
+        self.outtake.update_manually(self._resolved_step_outtake)
+
+        if self._resolved_step_match is True:
+            self.matchloader.update_manually(1)
+        elif self._resolved_step_match is False:
+            self.matchloader.update_manually(0)
+
+        if self.descore is not None:
+            if self._resolved_step_descore is True:
+                self.descore.update_manually(1)
+            elif self._resolved_step_descore is False:
+                self.descore.update_manually(0)
+
+        if self._active_step_same_position:
+            if self._resolved_step_heading is not None:
+                if not self._heading_only_settled(self._resolved_step_heading):
+                    return
+            else:
+                self._command_drive_smoothed(0.0, 0.0)
+            self._finish_step_delay_if_needed()
         else:
-            self.matchloader.update_manually(step.matchloader_speed)
+            if self.target_active:
+                self.update_target()
+                return
+            if not self.arrived_at_target:
+                # Target still settling or pose unavailable; wait.
+                self._command_drive_smoothed(0.0, 0.0)
+                return
+            self._finish_step_delay_if_needed()
 
 class WrappedButton:
     def __init__(self, button):
@@ -2000,9 +2982,23 @@ class GameState:
         return "unknown"
         
 def autonomous_start():
-    # Q4-referenced target; set_target mirrors for detected startup quadrant.
-    auton.set_target(-1200, -900, None)
-    logger.log("Autonomous started.")
+    try:
+        if Filter.force_recenter_from_gps():
+            logger.log("Pose recentered from GPS")
+        else:
+            # Fallback: use an averaged GPS reading even when quality is below
+            # strict threshold so autonomous always starts from a fresh pose.
+            fallback = GPS.get_accurate_reading(samples=8, delay_ms=25)
+            if fallback is not None and Filter.force_recenter(fallback[0], fallback[1], fallback[2]):
+                logger.warn("Pose recentered from averaged GPS fallback")
+            else:
+                logger.warn("GPS recenter unavailable; using current pose")
+    except Exception:
+        logger.warn("GPS recenter failed; using current pose")
+
+    auton_manager.select_slot(auton_manager.selected_slot)
+    auton.start()
+    logger.log("Autonomous started with slot " + str(auton_manager.selected_slot) + ".")
 
 def usercontrol_start():
     logger.log("User control started.")
@@ -2022,8 +3018,8 @@ brain.screen.render()
 logger = Logger(brain, max_lines=50)
 logger.log("Logger initialized.")
 descore = ButtonControlledPneumatic(controller.buttonUp, DigitalOut(brain.three_wire_port.a))
-intake = Intake(controller, Motor(Ports.PORT9))
-outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7), speed=100)
+intake = Intake(controller, Motor(Ports.PORT9, GearSetting.RATIO_6_1, False))
+outtake = ButtonControlledMotor(controller.buttonL1, controller.buttonL2, Motor(Ports.PORT7, GearSetting.RATIO_6_1, False), speed=100)
 matchloader = ButtonControlledPneumatic(controller.buttonDown, DigitalOut(brain.three_wire_port.b))
 heightadjuster = ButtonControlledPneumatic(controller.buttonB, DigitalOut(brain.three_wire_port.c))
 competition = Competition(usercontrol_start, autonomous_start)
@@ -2038,8 +3034,16 @@ GPS_HEADING_OFFSET_DEG = 180.0
 GPS = GPSSensor(Gps(Ports.PORT10), heading_offset_deg=GPS_HEADING_OFFSET_DEG)
 GPS.set_origin(GPS_MOUNT_X_MM, GPS_MOUNT_Y_MM)
 drivetrain = DriveController(
-    [Motor(Ports.PORT4), Motor(Ports.PORT5), Motor(Ports.PORT6)],
-    [Motor(Ports.PORT1), Motor(Ports.PORT2), Motor(Ports.PORT3)],
+    [
+        Motor(Ports.PORT4, GearSetting.RATIO_6_1, False),
+        Motor(Ports.PORT5, GearSetting.RATIO_6_1, False),
+        Motor(Ports.PORT6, GearSetting.RATIO_6_1, False),
+    ],
+    [
+        Motor(Ports.PORT1, GearSetting.RATIO_6_1, False),
+        Motor(Ports.PORT2, GearSetting.RATIO_6_1, False),
+        Motor(Ports.PORT3, GearSetting.RATIO_6_1, False),
+    ],
     controller,
 )
 Filter = KalmanFilter(GPS, drivetrain)
@@ -2070,19 +3074,38 @@ auton = AutonomousController(
     pose_filter=Filter,
     game_state=game_state,
 )
-# Five autonomous step slots. Format:
-# left, right, intake speed, outtake speed, matchloader speed, duration (seconds)
-slot_routines = {
-    1: StepAutonomousRoutine("Steps Slot 1"),
-    2: StepAutonomousRoutine("Steps Slot 2"),
-    3: StepAutonomousRoutine("Steps Slot 3"),
-    4: StepAutonomousRoutine("Steps Slot 4"),
-    5: StepAutonomousRoutine("Steps Slot 5"),
-}
+# Five autonomous step slots.
+# steps=[
+#   [AutonomousStep(...), AutonomousStep(...)],
+#   [slot2 steps],
+#   [slot3 steps],
+#   [slot4 steps],
+#   [slot5 steps],
+# ]
+# Step format:
+# AutonomousStep(x, y, heading=None, intake=0, outtake=0, match=None, descore=None, delay=0)
+steps = [
+    [
+        AutonomousStep(-600, -600, intake=100, outtake=-100, delay=0.3),
+        AutonomousStep(-1200, -1200, intake=0, heading = 270, outtake=-20),
+        AutonomousStep(-630, -1200, intake=100, outtake=-20),
+        AutonomousStep(None, None, intake = 100, outtake=100, delay=5),
+    ],
+    [
+        AutonomousStep(-600, -600, intake=100, outtake=-100, delay=0.3)
+    ],
+    [],
+    [],
+    [
+        AutonomousStep(-1200, -900, intake=100, outtake=50),
+        AutonomousStep(-1200, -900, heading=90, intake=100, outtake=50, match=False, descore=False),
+    ],
+]
 
-# Default sample routine in slot 5
-slot_routines[5].add_step(-30, -30, 100, 50, 0, 2, matchloader_toggle_state="b")
-slot_routines[5].add_step(0, 0, 100, 50, 0, 5, matchloader_toggle_state="b")
+slot_routines = {}
+for slot_idx in range(1, 6):
+    slot_steps = steps[slot_idx - 1] if slot_idx - 1 < len(steps) else []
+    slot_routines[slot_idx] = StepAutonomousRoutine("Steps Slot " + str(slot_idx), steps=slot_steps)
 
 # Autonomous manager for selecting/testing step slots
 auton_manager = AutonomousManager(brain, logger, auton, slot_routines)
@@ -2259,6 +3282,7 @@ while True:
             descore.update_from_controller()
             heightadjuster.update_from_controller()
         Filter.update() # update position estimate
+        # logger.log("x: " + str(int(Filter.get_estimate().x)) + " y: " + str(int(Filter.get_estimate().y)) + " h: " + str(int(Filter.get_estimate().z)))
     else:
         drivetrain.update_manually(0,0)
         drivetrain.update_motor_speeds()
